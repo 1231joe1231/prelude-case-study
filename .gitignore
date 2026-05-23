@@ -21,6 +21,9 @@ dist/
 *.sqlite
 *.sqlite3
 
+# Input data (not checked in)
+backend/input/
+
 # IDE
 .idea/
 .vscode/
