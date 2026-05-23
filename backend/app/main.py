@@ -6,7 +6,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .db import Base, SessionLocal, engine
 from .ingest import ingest_all
-from .routers import health, tables
+from .ranking.persona import clear_cache as clear_persona_cache
+from .routers import health, ranking, tables
 
 log = logging.getLogger("uvicorn.error")
 
@@ -19,6 +20,7 @@ async def lifespan(app: FastAPI):
     session = SessionLocal()
     try:
         counts = ingest_all(session)
+        clear_persona_cache()
         log.info("startup ingest complete: %s", counts)
     finally:
         session.close()
@@ -37,3 +39,4 @@ app.add_middleware(
 
 app.include_router(health.router, prefix="/api")
 app.include_router(tables.router, prefix="/api")
+app.include_router(ranking.router, prefix="/api")
