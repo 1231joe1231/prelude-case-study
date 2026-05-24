@@ -23,7 +23,12 @@ from ..pipeline import selection
 from ..ranking.cache import get_cached, stats as cache_stats
 from ..ranking.features import extract_all
 from ..ranking.persona import get_persona
-from ..ranking.score import WEIGHTS, score_lead
+from ..ranking.score import (
+    HS_MISMATCH_PENALTY,
+    NOT_INTERESTED_PENALTY,
+    WEIGHTS,
+    score_lead,
+)
 from ..ranking.trace import events_since, get_trace, trace_count
 
 router = APIRouter(prefix="/leads", tags=["ranking"])
@@ -55,10 +60,23 @@ def get_ranked(
             src = cached.source
             text = cached.text
             fact_ok = cached.factuality_ok
+
+        # Compute the actual modifier applied to this lead's composite so the
+        # frontend can render the math accurately (which penalty fired and
+        # with what multiplier). Order matches score_lead().
+        raw_sum = sum(WEIGHTS[k] * v for k, v in components.items())
+        modifiers: list[dict] = []
+        if f.hs_overlap_count == 0 and f.lead_hs_codes:
+            modifiers.append({"reason": "hs_mismatch", "multiplier": HS_MISMATCH_PENALTY})
+        if f.is_not_interested:
+            modifiers.append({"reason": "not_interested", "multiplier": NOT_INTERESTED_PENALTY})
+
         rows.append({
             "lead_id": f.lead_id,
             "company": f.company,
             "score": round(composite, 4),
+            "raw_composite": round(raw_sum, 4),
+            "modifiers": modifiers,
             "components": {k: round(v, 4) for k, v in components.items()},
             "features": f.to_dict(),
             "reasoning": text,
@@ -70,6 +88,9 @@ def get_ranked(
 
     return {
         "rows": rows,
+        # Live weights — frontend should drive the breakdown table from these,
+        # never from a hardcoded copy that can drift from the backend tune.
+        "weights": WEIGHTS,
         # Stats computed over RANKED ROWS, not whole cache, so totals match
         # the displayed table. Whole-cache stats live on /api/ranking/events.
         "stats": row_stats,

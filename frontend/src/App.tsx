@@ -67,10 +67,14 @@ const TABLE_CONFIG: Record<TableKey, { label: string; cols: string[]; endpoint: 
 
 type RationaleSource = 'pending' | 'llm' | 'fallback' | 'not_generated'
 
+type ScoreModifier = { reason: string; multiplier: number }
+
 type RankedLead = {
   lead_id: string
   company: string
   score: number
+  raw_composite: number
+  modifiers: ScoreModifier[]
   components: Record<string, number>
   features: Record<string, unknown>
   reasoning: string
@@ -81,6 +85,7 @@ type RankedLead = {
 
 type RankedResponse = {
   rows: RankedLead[]
+  weights: Record<string, number>
   stats: Record<string, number>
   cache_stats: Record<string, number>
   pending_count: number
@@ -263,14 +268,11 @@ function RationaleCell({ row }: { row: RankedLead }) {
 
 const POLL_INTERVAL_MS = 2000
 
-const SCORE_WEIGHTS: Record<string, number> = {
-  volume: 0.20,
-  recency: 0.15,
-  hs_fit: 0.25,
-  competitive: 0.15,
-  reachability: 0.15,
-  seniority: 0.10,
-}
+// Weights now sourced from /api/leads/ranked response (`weights` field), so
+// retuning in backend score.py reflects immediately in the trace UI. The
+// constant below is only a last-resort fallback shape when the response is
+// missing the field (older backend); should never be hit in normal use.
+const FALLBACK_SCORE_WEIGHTS: Record<string, number> = {}
 
 function fmtTs(ts: number): string {
   return new Date(ts * 1000).toLocaleTimeString()
@@ -314,12 +316,22 @@ function KV({ k, v }: { k: string; v: React.ReactNode }) {
   )
 }
 
-function TraceExpander({ row, trace, error }: { row: RankedLead; trace: RationaleTrace | null; error: string | null }) {
+function TraceExpander({
+  row,
+  trace,
+  error,
+  weights,
+}: {
+  row: RankedLead
+  trace: RationaleTrace | null
+  error: string | null
+  weights: Record<string, number>
+}) {
   if (error) return <div className="px-4 py-3 text-xs text-red-600">trace error: {error}</div>
   if (!trace) return <div className="px-4 py-3 text-xs text-slate-500">loading trace…</div>
 
   const f = row.features as Record<string, unknown>
-  const synced = !!f.is_synced_to_crm
+  const W = Object.keys(weights).length ? weights : FALLBACK_SCORE_WEIGHTS
 
   return (
     <div className="space-y-5 bg-slate-50 px-5 py-4 text-[11px]">
@@ -339,28 +351,54 @@ function TraceExpander({ row, trace, error }: { row: RankedLead; trace: Rational
       <div>
         <StageHeader n={2} title="Scoring (weighted composition)" />
         <div className="rounded-md border border-slate-200 bg-white p-3">
-          <div className="grid grid-cols-[1fr_60px_60px_80px] gap-x-4 gap-y-1 font-mono">
+          <div className="grid grid-cols-[1fr_60px_70px_80px] gap-x-4 gap-y-1 font-mono">
             <div className="text-[10px] uppercase tracking-wider text-slate-500">component</div>
             <div className="text-right text-[10px] uppercase tracking-wider text-slate-500">value</div>
             <div className="text-right text-[10px] uppercase tracking-wider text-slate-500">× weight</div>
             <div className="text-right text-[10px] uppercase tracking-wider text-slate-500">= contrib.</div>
             {Object.entries(row.components).map(([k, v]) => {
-              const w = SCORE_WEIGHTS[k] ?? 0
+              const w = W[k] ?? 0
               const contrib = v * w
+              const negWeight = w < 0
               return (
                 <React.Fragment key={k}>
-                  <div className="text-slate-700">{k}</div>
+                  <div className={negWeight ? 'text-rose-700' : 'text-slate-700'}>{k}</div>
                   <div className="text-right text-slate-700">{v.toFixed(3)}</div>
-                  <div className="text-right text-slate-500">{w.toFixed(2)}</div>
-                  <div className="text-right font-semibold text-slate-900">{contrib.toFixed(3)}</div>
+                  <div className={'text-right ' + (negWeight ? 'text-rose-600' : 'text-slate-500')}>
+                    {w >= 0 ? '+' : ''}{w.toFixed(2)}
+                  </div>
+                  <div className={'text-right font-semibold ' + (contrib < 0 ? 'text-rose-700' : 'text-slate-900')}>
+                    {contrib >= 0 ? '+' : ''}{contrib.toFixed(3)}
+                  </div>
                 </React.Fragment>
               )
             })}
+
+            {/* Raw composite (pre-modifier) */}
             <div className="col-span-3 border-t border-slate-200 pt-1 text-right text-[10px] uppercase tracking-wider text-slate-500">
-              {synced && 'composite × 0.5 (synced_to_crm penalty) ='}
-              {!synced && 'composite ='}
+              raw composite (Σ weighted)
             </div>
-            <div className="border-t border-slate-200 pt-1 text-right font-mono font-semibold text-slate-900">{row.score.toFixed(3)}</div>
+            <div className="border-t border-slate-200 pt-1 text-right font-mono font-semibold text-slate-900">
+              {row.raw_composite.toFixed(3)}
+            </div>
+
+            {/* Applied modifiers, if any */}
+            {row.modifiers.map((m) => (
+              <React.Fragment key={m.reason}>
+                <div className="col-span-3 text-right text-[10px] uppercase tracking-wider text-rose-600">
+                  × {m.multiplier.toFixed(2)} ({m.reason})
+                </div>
+                <div className="text-right font-mono text-rose-700">×{m.multiplier.toFixed(2)}</div>
+              </React.Fragment>
+            ))}
+
+            {/* Final clamped score */}
+            <div className="col-span-3 border-t border-slate-200 pt-1 text-right text-[10px] uppercase tracking-wider text-slate-700">
+              final score (clamped to [0, 1])
+            </div>
+            <div className="border-t border-slate-200 pt-1 text-right font-mono font-bold text-slate-900">
+              {row.score.toFixed(3)}
+            </div>
           </div>
         </div>
       </div>
@@ -655,6 +693,7 @@ function DeliverablePage() {
                             row={r}
                             trace={traces[r.lead_id] ?? null}
                             error={traceErrors[r.lead_id] ?? null}
+                            weights={resp?.weights ?? FALLBACK_SCORE_WEIGHTS}
                           />
                         </td>
                       </tr>
