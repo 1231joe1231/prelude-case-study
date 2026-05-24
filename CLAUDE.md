@@ -16,7 +16,7 @@ Built:
 - `backend/app/ingest.py` — reads CSVs from `backend/input/{INPUT_VERSION}/` (default `real`); flattens BOL payloads; normalizes HS/ports/products into `lead_attributes`; resolves shipment FKs via normalized name + alias map.
 - `backend/app/ranking/persona.py` — top-N HS codes aggregated from `competitor_attributes` (cached).
 - `backend/app/ranking/features.py` — `LeadFeatures` dataclass + pure per-lead extraction.
-- `backend/app/ranking/score.py` — weighted 6-component composite. Live WEIGHTS: `hs_fit=0.35, volume=0.30, reachability=0.25, seniority=0.10, recency=0, competitive=0`. Penalties: `not_interested → ×0.4`, `hs_overlap_count=0 → ×0.5`. See module docstring for tuning rationale.
+- `backend/app/ranking/score.py` — weighted 7-component composite. Live WEIGHTS: `hs_fit=+0.30, volume=+0.25, reachability=+0.20, seniority=+0.10, demand_validated=+0.10, recency=+0.05 (signed signal), concentration=−0.05 (penalty signal)`. Missing-data signals contribute 0 (no false reward/penalty). Multiplicative modifiers: `not_interested → ×0.4`, `hs_overlap_count=0 → ×0.5`. See module docstring for tuning rationale.
 - `backend/app/ranking/rationale.py` — Anthropic SDK single-call per lead, ephemeral prompt cache, factuality check (HS / ports / competitors / titles / numeric BOL anchors), deterministic fallback on missing key / 429 / factuality fail. Retry on transient errors. `CONCURRENCY=4` (free-tier 50 req/min).
 - `backend/app/ranking/cache.py` — in-memory cache; streams per-lead writes to cache + trace as each LLM call completes (not gather-then-flush).
 - `backend/app/ranking/trace.py` — `RationaleTrace` (full 6-stage audit) + global event ring buffer.
@@ -105,7 +105,7 @@ For each lead, compute features that combine the three CSVs:
 | leads.csv `totalShipments`, `mostRecentShipment` | volume + recency | high-volume, recently active importers are real buyers |
 | leads.csv `hsCodes` ∩ factory HS profile | product fit | matches what the factory actually makes |
 | leads.csv `topPorts` | logistics fit | factories near specific ports prefer certain destinations |
-| bol_competitors.csv overlap on HS codes | competitive pressure | importer already buying from many Chinese factories = harder to win |
+| bol_competitors.csv overlap on HS codes | demand validation (presence) + concentration penalty (dominance) | known competitor shipping to lead = proven buyer (positive); single supplier >50% share = locked in (negative) |
 | bol_competitors.csv `LOW/MED/HIGH` bucket on overlapping competitors | concentration risk | dominated by one big competitor = uphill |
 | personnel.csv contact count + email presence | reachability | a lead with no email is not actionable |
 | personnel.csv title (if present) | seniority | decision-maker > generic ops contact |
@@ -146,7 +146,7 @@ Single page, single table. Columns: company, score, reasoning, checkbox. No filt
 - `synced_to_crm` is treated as a neutral status on this dataset (every eligible lead is synced_to_crm; uniform penalty would be a no-op).
 - `not_interested` is penalized (× 0.4), not dropped — re-engagement is a real sales pattern when new signal arrives.
 - Zero HS-overlap leads are penalized × 0.5 — we have no product story to pitch them with regardless of activity.
-- Recency and competitive pressure features are computed and exposed, but weighted 0 in scoring until source data improves (16/121 leads have `most_recent_shipment`; only 5/50 top-ranked have any competitor edges).
+- Recency is a SIGNED signal (+1 fresh, −1 stale, 0 if missing) with weight +0.05. Competitive split into demand_validated (+0.10, presence of any competitor edge) + concentration (−0.05 penalty, ramps from 30% to 100% top supplier share). Missing data on any of these contributes 0 — no false reward/penalty for data gaps. Source coverage: 16/121 leads have `most_recent_shipment`, 5/50 top-ranked have resolved competitor edges; once coverage grows the same weights start producing stronger signals without code changes.
 - Legacy `score` columns are ignored per brief.
 
 ## Conventions

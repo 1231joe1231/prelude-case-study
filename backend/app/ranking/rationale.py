@@ -92,6 +92,11 @@ Status semantics — read carefully:
 - `synced_to_crm` is the NORMAL/default state in this dataset; every active importer is already in the operator's CRM. It is NOT a negative signal. Do not criticize it, do not call it "already in CRM", do not say "deprioritize for that reason", do not mention it at all unless directly relevant. Treat absence of `synced_to_crm` as neutral.
 - `not_interested` means the operator has previously contacted this lead and they declined. They are still worth pursuing on a strong new signal — frame the rationale as a re-engagement angle citing what changed (volume, recency, new contact, HS shift). Do not treat as disqualifying.
 
+Supply landscape semantics — read carefully:
+- A known competitor already shipping to this lead is a POSITIVE signal: the lead is a proven buyer of this product category, demand is validated, you are not selling cold. Frame it as opportunity, not as obstacle.
+- A SINGLE supplier holding a dominant share (over ~50%) IS a negative signal: the lead is locked in and harder to crack on price alone. Surface this only when concentration is high.
+- Zero known competitors usually means data gap, not an open market. Do not over-claim "uncontested" — call it "no competitors visible in the dataset" or skip the angle entirely.
+
 The payload includes a "Top signal" field — let it guide where you anchor the rationale, but cite the literal data, not the label.
 
 Respond with ONLY a JSON object of shape:
@@ -104,12 +109,13 @@ Respond with ONLY a JSON object of shape:
 RationaleSource = Literal["llm", "fallback_no_key", "fallback_error", "fallback_factuality"]
 
 _DRIVER_BLURB: dict[str, str] = {
-    "volume":       "high shipment volume",
-    "recency":      "recent shipping activity",
-    "hs_fit":       "HS-code overlap with factory profile",
-    "competitive":  "low competitor pressure",
-    "reachability": "reachable contacts",
-    "seniority":    "decision-maker contact present",
+    "volume":           "high shipment volume",
+    "recency":          "recent shipping activity",
+    "hs_fit":           "HS-code overlap with factory profile",
+    "reachability":     "reachable contacts",
+    "seniority":        "decision-maker contact present",
+    "demand_validated": "known competitors already ship this lead — proven buyer",
+    "concentration":    "one supplier dominates this lead — entry harder",
 }
 
 
@@ -148,13 +154,14 @@ def _build_user_payload(f: LeadFeatures, components: dict[str, float]) -> str:
         ),
         f"Lead's top ports: {', '.join(f.top_ports) or 'none'}",
         (
-            f"Competitive pressure: {f.competitor_count} distinct exporters shipping to this lead"
-            + (f", top exporter={f.top_competitor_name}" if f.top_competitor_name else "")
+            f"Supply landscape: {f.competitor_count} known Chinese exporter(s) currently ship to this lead"
+            + (f", largest is {f.top_competitor_name}" if f.top_competitor_name else "")
             + (
-                f", max_supplier_share_pct={f.max_competitor_share_pct:.1f}"
+                f" holding {f.max_competitor_share_pct:.1f}% of supplier volume"
                 if f.max_competitor_share_pct is not None
                 else ""
             )
+            + ". Presence of competitors validates demand for this product category."
         ),
         (
             f"Personnel: {f.contact_count} contacts in dataset, has_email={f.has_email}, "
@@ -236,15 +243,45 @@ def _factuality_check(text: str, f: LeadFeatures) -> FactualityCheck:
     if f.senior_contact_title and f.senior_contact_title.lower() in lower:
         cited_titles.append(f.senior_contact_title)
 
-    # Company-name validation: find every Inc/LLC/Co/Ltd-suffixed phrase, normalize
-    # both that and the lead's company name, compare. Known non-lead entities
-    # (resolved competitor name) are whitelisted so they don't count as invalid.
+    # Company-name validation: find every Inc/LLC/Co/Ltd-suffixed phrase,
+    # normalize, compare against the lead's company name AND known
+    # non-lead entities (competitor, senior contact name) that are
+    # legitimately quotable.
+    #
+    # Matching is by TOKEN-SET CONTAINMENT, not exact equality, so:
+    #   lead "Stale Perfect Decor Co" + LLM "Perfect Decor"  → accept
+    #   lead "Pearhead Inc"           + LLM "Pearson Inc"    → reject
+    # Tokens of the cited phrase must be a subset of (or superset of)
+    # the candidate's tokens. Empty intersections still fail.
+    def _token_set(s: str) -> set[str]:
+        return {t for t in s.split() if t}
+
     lead_norm = _normalize_company(f.company) if f.company else ""
-    whitelist = {lead_norm}
+    lead_tokens = _token_set(lead_norm)
+    candidate_token_sets: list[set[str]] = []
+    if lead_tokens:
+        candidate_token_sets.append(lead_tokens)
     if f.top_competitor_name:
-        whitelist.add(_normalize_company(f.top_competitor_name))
+        candidate_token_sets.append(_token_set(_normalize_company(f.top_competitor_name)))
     if f.senior_contact_name:
-        whitelist.add(_normalize_company(f.senior_contact_name))
+        candidate_token_sets.append(_token_set(_normalize_company(f.senior_contact_name)))
+
+    def _matches_any_candidate(tokens: set[str]) -> tuple[bool, bool]:
+        """Return (matches_anything, matches_the_lead_specifically)."""
+        if not tokens:
+            return False, False
+        matched = False
+        matched_lead = False
+        for cand in candidate_token_sets:
+            if not cand:
+                continue
+            # Containment in either direction (handles abbreviations like
+            # dropping a leading modifier word) — but never empty intersections.
+            if tokens & cand and (tokens <= cand or cand <= tokens):
+                matched = True
+                if cand is lead_tokens or cand == lead_tokens:
+                    matched_lead = True
+        return matched, matched_lead
 
     cited_companies: list[str] = []
     invalid_companies: list[str] = []
@@ -252,14 +289,17 @@ def _factuality_check(text: str, f: LeadFeatures) -> FactualityCheck:
         norm = _normalize_company(match)
         if not norm:
             continue
-        if norm in whitelist:
-            if norm == lead_norm and norm:
+        tokens = _token_set(norm)
+        matched, matched_lead = _matches_any_candidate(tokens)
+        if matched:
+            if matched_lead:
                 cited_companies.append(match.strip())
         else:
             invalid_companies.append(match.strip())
 
-    # Also catch lead-name mentions WITHOUT a corporate suffix (rare but valid
-    # anchor). Substring match on the normalized lead name in the lowered text.
+    # Also catch lead-name mentions WITHOUT a corporate suffix (rare but
+    # valid anchor). Substring match on the normalized lead name in the
+    # lowered text.
     if lead_norm and lead_norm in lower and not cited_companies:
         cited_companies.append(f.company)
 
@@ -329,11 +369,16 @@ def fallback_text(f: LeadFeatures, components: dict[str, float]) -> str:
         parts.append(f"via {', '.join(f.top_ports[:2])}")
 
     if f.top_competitor_name and f.max_competitor_share_pct:
-        parts.append(
-            f"{f.top_competitor_name} supplies {f.max_competitor_share_pct:.1f}% of volume"
-        )
+        if f.max_competitor_share_pct >= 50:
+            parts.append(
+                f"{f.top_competitor_name} dominates supply at {f.max_competitor_share_pct:.1f}% — entry difficult"
+            )
+        else:
+            parts.append(
+                f"{f.competitor_count} known supplier(s); largest ({f.top_competitor_name}) holds {f.max_competitor_share_pct:.1f}% — demand validated, market not locked"
+            )
     elif f.competitor_count:
-        parts.append(f"{f.competitor_count} competing exporters")
+        parts.append(f"{f.competitor_count} known supplier(s) — demand validated for this product")
 
     if f.senior_contact_title:
         parts.append(f"reachable via {f.senior_contact_title}")
