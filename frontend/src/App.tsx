@@ -1190,6 +1190,18 @@ const STAGE_LABEL: Record<PipelineStage, string> = {
   error: 'Error',
 }
 
+function Spinner({ className = '' }: { className?: string }) {
+  return (
+    <span
+      aria-hidden="true"
+      className={
+        'inline-block h-3 w-3 shrink-0 animate-spin rounded-full border-2 border-current border-t-transparent ' +
+        className
+      }
+    />
+  )
+}
+
 function StageStep({
   stage, currentStage, isError, llmDone, llmTotal,
 }: {
@@ -1206,24 +1218,47 @@ function StageStep({
 
   const cls = {
     done:    'bg-emerald-100 text-emerald-800 ring-emerald-200',
-    active:  'bg-slate-900 text-white ring-slate-900',
+    active:  'bg-slate-900 text-white ring-slate-900 shadow-md',
     pending: 'bg-slate-100 text-slate-400 ring-slate-200',
   }[state]
 
   const showProgress = stage === 'llm_batching' && state === 'active' && llmTotal > 0
+  const isActiveBusy = state === 'active' && stage !== 'complete' && stage !== 'ingested' && !isError
   return (
-    <div className={`flex flex-col gap-1 rounded-md px-3 py-2 ring-1 ${cls}`}>
-      <div className="text-[10px] uppercase tracking-wider opacity-80">
-        {STAGE_ORDER.indexOf(stage) + 1}. {STAGE_LABEL[stage]}
+    <div className={`flex min-w-[140px] flex-col gap-1 rounded-md px-3 py-2 ring-1 transition-all ${cls}`}>
+      <div className="flex items-center gap-1.5 text-[10px] uppercase tracking-wider opacity-90">
+        <span>{STAGE_ORDER.indexOf(stage) + 1}.</span>
+        <span className="flex-1">{STAGE_LABEL[stage]}</span>
+        {isActiveBusy && <Spinner />}
+        {state === 'done' && <span className="text-emerald-700">✓</span>}
       </div>
       {showProgress && (
         <div className="font-mono text-xs">
           {llmDone}/{llmTotal}
-          <div className="mt-0.5 h-1 w-24 overflow-hidden rounded-full bg-white/30">
-            <div className="h-full bg-white" style={{ width: `${(llmDone / llmTotal) * 100}%` }} />
+          <div className="mt-0.5 h-1 w-32 overflow-hidden rounded-full bg-white/30">
+            <div
+              className="h-full bg-white transition-[width] duration-500"
+              style={{ width: `${(llmDone / llmTotal) * 100}%` }}
+            />
           </div>
         </div>
       )}
+      {isActiveBusy && !showProgress && (
+        // Indeterminate shimmer bar for stages with no measurable progress
+        <div className="mt-0.5 h-1 w-32 overflow-hidden rounded-full bg-white/30">
+          <div className="h-full w-1/3 animate-[shimmer_1.2s_ease-in-out_infinite] bg-white" />
+        </div>
+      )}
+    </div>
+  )
+}
+
+function BusyBar({ busy }: { busy: boolean }) {
+  // Indeterminate top-of-page progress strip while any backend stage is in flight.
+  if (!busy) return null
+  return (
+    <div className="h-1 w-full overflow-hidden rounded-full bg-slate-200">
+      <div className="h-full w-1/3 animate-[shimmer_1.4s_ease-in-out_infinite] bg-slate-900" />
     </div>
   )
 }
@@ -1236,10 +1271,18 @@ function PipelinePage() {
   const [status, setStatus] = useState<PipelineStatus | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [limit, setLimit] = useState(50)
-  const [acting, setActing] = useState(false)
+  // Per-action in-flight tracker. Holds e.g. 'switch:golden' or 'run' or
+  // 'reset'. Used to drive button-level spinners + disable state. Cleared
+  // when the next /status poll reflects the action's effect.
+  const [pendingOp, setPendingOp] = useState<string | null>(null)
+  // Optimistic stage override: showing 'ingesting' immediately after click
+  // even before the backend reports it, so the UI doesn't look frozen.
+  const [optimisticStage, setOptimisticStage] = useState<PipelineStage | null>(null)
+  const pollRef = React.useRef<(() => void) | null>(null)
 
-  const isBusy = status ? BUSY_STAGES.includes(status.stage) : false
-  const pollMs = isBusy ? 1000 : 4000
+  // Treat the optimistic value as authoritative until the next poll lands.
+  const displayedStage: PipelineStage = optimisticStage ?? status?.stage ?? 'idle'
+  const isBusy = BUSY_STAGES.includes(displayedStage)
 
   useEffect(() => {
     let stopped = false
@@ -1249,7 +1292,18 @@ function PipelinePage() {
         .then((s) => {
           if (stopped) return
           setStatus(s)
-          timer = setTimeout(tick, BUSY_STAGES.includes(s.stage) ? 1000 : 4000)
+          // Clear optimistic override once the server reports a non-stale stage.
+          // The optimistic stage is one of the busy stages — once the server
+          // either confirms it OR moves past it, we drop the override.
+          setOptimisticStage((cur) => {
+            if (cur === null) return null
+            if (s.stage === cur) return null               // server caught up
+            if (!BUSY_STAGES.includes(s.stage)) return null // server is past it
+            return cur
+          })
+          // Clear pendingOp once the server is no longer busy.
+          if (!BUSY_STAGES.includes(s.stage)) setPendingOp(null)
+          timer = setTimeout(tick, BUSY_STAGES.includes(s.stage) ? 800 : 4000)
         })
         .catch((e) => {
           if (stopped) return
@@ -1257,44 +1311,56 @@ function PipelinePage() {
           timer = setTimeout(tick, 4000)
         })
     }
+    pollRef.current = tick
     tick()
-    return () => { stopped = true; if (timer) clearTimeout(timer) }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pollMs])
+    return () => { stopped = true; if (timer) clearTimeout(timer); pollRef.current = null }
+  }, [])
+
+  // Force a poll immediately (used after POSTing an action so we don't wait
+  // up to 4s for the next scheduled tick).
+  const forcePoll = () => {
+    if (pollRef.current) pollRef.current()
+  }
 
   const switchInput = async (version: 'real' | 'golden') => {
-    setActing(true)
+    setPendingOp(`switch:${version}`)
+    setOptimisticStage('ingesting')
     setError(null)
     try {
       await api.post('/pipeline/switch_input', { version })
+      forcePoll()
     } catch (e) {
       setError(String(e))
-    } finally {
-      setActing(false)
+      setOptimisticStage(null)
+      setPendingOp(null)
     }
   }
 
   const runPipeline = async () => {
-    setActing(true)
+    setPendingOp('run')
+    setOptimisticStage('persona_inferring')
     setError(null)
     try {
       await api.post('/pipeline/run', { limit })
+      forcePoll()
     } catch (e) {
       setError(String(e))
-    } finally {
-      setActing(false)
+      setOptimisticStage(null)
+      setPendingOp(null)
     }
   }
 
   const resetCache = async () => {
-    setActing(true)
+    setPendingOp('reset')
     setError(null)
     try {
       await api.post('/pipeline/reset_cache')
+      forcePoll()
     } catch (e) {
       setError(String(e))
     } finally {
-      setActing(false)
+      // reset_cache is synchronous on the server, so we can drop pendingOp now
+      setPendingOp(null)
     }
   }
 
@@ -1327,24 +1393,29 @@ function PipelinePage() {
 
       {/* Input switcher */}
       <section className="shrink-0 rounded-lg border border-slate-200 bg-white p-4">
-        <h3 className="mb-2 text-xs font-semibold uppercase tracking-wider text-slate-700">Input dataset</h3>
+        <div className="mb-2 flex items-center justify-between gap-2">
+          <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-700">Input dataset</h3>
+          <div className="min-w-32 flex-1 max-w-64"><BusyBar busy={isBusy} /></div>
+        </div>
         <div className="flex flex-wrap items-center gap-3">
           {(['real', 'golden'] as const).map((v) => {
             const active = status.input_version === v
+            const switching = pendingOp === `switch:${v}`
             return (
               <button
                 key={v}
-                disabled={!canSwitch || acting}
+                disabled={!canSwitch || pendingOp !== null}
                 onClick={() => switchInput(v)}
                 className={
-                  'rounded-md px-3 py-1.5 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40 ' +
+                  'inline-flex items-center gap-2 rounded-md px-3 py-1.5 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40 ' +
                   (active
                     ? 'bg-slate-900 text-white'
                     : 'bg-slate-100 text-slate-700 hover:bg-slate-200')
                 }
               >
+                {switching && <Spinner />}
                 {v === 'real' ? 'Real (121 leads)' : 'Golden (10 leads — synthetic)'}
-                {active && <span className="ml-1.5 text-[10px] opacity-70">active</span>}
+                {active && !switching && <span className="text-[10px] opacity-70">active</span>}
               </button>
             )
           })}
@@ -1354,7 +1425,10 @@ function PipelinePage() {
         </div>
 
         {Object.keys(status.ingest_counts).length > 0 && (
-          <div className="mt-3 grid grid-cols-3 gap-2 text-xs sm:grid-cols-6">
+          <div className={
+            'mt-3 grid grid-cols-3 gap-2 text-xs sm:grid-cols-6 transition-opacity ' +
+            (displayedStage === 'ingesting' ? 'opacity-40' : 'opacity-100')
+          }>
             {(['leads', 'personnel', 'competitors', 'lead_attributes', 'competitor_attributes', 'shipments'] as const).map((k) => (
               <div key={k} className="rounded bg-slate-50 px-2 py-1">
                 <div className="text-[10px] uppercase tracking-wider text-slate-500">{k}</div>
@@ -1379,17 +1453,19 @@ function PipelinePage() {
             />
           </label>
           <button
-            disabled={!canRun || acting}
+            disabled={!canRun || pendingOp !== null}
             onClick={runPipeline}
-            className="rounded-md bg-emerald-600 px-4 py-1.5 text-sm font-medium text-white transition-colors hover:bg-emerald-700 disabled:cursor-not-allowed disabled:bg-slate-300"
+            className="inline-flex items-center gap-2 rounded-md bg-emerald-600 px-4 py-1.5 text-sm font-medium text-white transition-colors hover:bg-emerald-700 disabled:cursor-not-allowed disabled:bg-slate-300"
           >
-            {isBusy ? 'Running…' : 'Run pipeline'}
+            {(isBusy || pendingOp === 'run') && <Spinner />}
+            {isBusy ? STAGE_LABEL[displayedStage] + '…' : 'Run pipeline'}
           </button>
           <button
-            disabled={isBusy || acting}
+            disabled={isBusy || pendingOp !== null}
             onClick={resetCache}
-            className="rounded-md border border-slate-300 px-3 py-1.5 text-sm text-slate-700 transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
+            className="inline-flex items-center gap-2 rounded-md border border-slate-300 px-3 py-1.5 text-sm text-slate-700 transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
           >
+            {pendingOp === 'reset' && <Spinner />}
             Reset cache
           </button>
         </div>
@@ -1397,16 +1473,20 @@ function PipelinePage() {
 
       {/* Stage indicator */}
       <section className="shrink-0 rounded-lg border border-slate-200 bg-white p-4">
-        <h3 className="mb-3 text-xs font-semibold uppercase tracking-wider text-slate-700">
-          Stage: <span className="text-slate-900 normal-case">{STAGE_LABEL[status.stage]}</span>
-          {status.error && <span className="ml-2 rounded bg-red-100 px-2 py-0.5 text-[10px] font-medium text-red-700">{status.error}</span>}
-        </h3>
+        <div className="mb-3 flex items-center gap-3">
+          <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-700">
+            Stage: <span className="text-slate-900 normal-case">{STAGE_LABEL[displayedStage]}</span>
+            {isBusy && <Spinner className="ml-2 text-slate-700" />}
+            {status.error && <span className="ml-2 rounded bg-red-100 px-2 py-0.5 text-[10px] font-medium text-red-700">{status.error}</span>}
+          </h3>
+          <div className="flex-1 max-w-64"><BusyBar busy={isBusy} /></div>
+        </div>
         <div className="flex flex-wrap gap-2">
           {STAGE_ORDER.map((s) => (
             <StageStep
               key={s}
               stage={s}
-              currentStage={status.stage}
+              currentStage={displayedStage}
               isError={status.stage === 'error'}
               llmDone={status.llm_done}
               llmTotal={status.llm_total}

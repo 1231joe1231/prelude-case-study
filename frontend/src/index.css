@@ -1,1 +1,8 @@
 @import "tailwindcss";
+
+/* Indeterminate progress bar used by PipelinePage for stages whose duration
+   can't be measured (ingesting, persona, features, scoring). */
+@keyframes shimmer {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(400%); }
+}
