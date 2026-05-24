@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useState } from 'react'
 import {
   Background,
   Controls,
@@ -13,7 +13,7 @@ import '@xyflow/react/dist/style.css'
 import { api } from './lib/api'
 
 type Row = Record<string, unknown>
-type Page = 'deliverable' | 'tables' | 'graph'
+type Page = 'deliverable' | 'tables' | 'graph' | 'trace'
 type TableKey =
   | 'leads'
   | 'personnel'
@@ -65,6 +65,8 @@ const TABLE_CONFIG: Record<TableKey, { label: string; cols: string[]; endpoint: 
   shipments:             { label: 'shipments',             cols: SHIPMENT_COLS,  endpoint: '/tables/shipments' },
 }
 
+type RationaleSource = 'pending' | 'llm' | 'fallback'
+
 type RankedLead = {
   lead_id: string
   company: string
@@ -72,7 +74,64 @@ type RankedLead = {
   components: Record<string, number>
   features: Record<string, unknown>
   reasoning: string
+  rationale_source: RationaleSource
+  factuality_ok: boolean
   selected: boolean
+}
+
+type RankedResponse = {
+  rows: RankedLead[]
+  stats: Record<string, number>
+  pending_count: number
+}
+
+type LLMCallTrace = {
+  model: string
+  latency_ms: number
+  input_tokens: number | null
+  output_tokens: number | null
+  cache_read_input_tokens: number | null
+  cache_creation_input_tokens: number | null
+  raw_response_text: string | null
+  error: string | null
+}
+
+type FactualityCheck = {
+  ok: boolean
+  cited_hs_codes: string[]
+  cited_ports: string[]
+  cited_competitors: string[]
+  cited_titles: string[]
+  invalid_hs_codes: string[]
+  has_anchor: boolean
+  reason: string | null
+}
+
+type RationaleTrace = {
+  lead_id: string
+  generated_at: number
+  user_payload: string
+  system_prompt_excerpt: string
+  llm: LLMCallTrace | null
+  factuality: FactualityCheck | null
+  final_source: string
+  final_text: string
+  fallback_text: string | null
+}
+
+type TraceEvent = {
+  seq: number
+  ts: number
+  kind: string
+  summary: string
+  payload: Record<string, unknown>
+}
+
+type EventsResponse = {
+  events: TraceEvent[]
+  trace_count: number
+  cache_stats: Record<string, number>
+  weights: Record<string, number>
 }
 
 function renderCell(v: unknown): { display: string; title: string; muted: boolean } {
@@ -133,16 +192,301 @@ function ComponentBar({ name, value }: { name: string; value: number }) {
   )
 }
 
+function RationaleCell({ row }: { row: RankedLead }) {
+  if (row.rationale_source === 'pending') {
+    return (
+      <div className="flex items-start gap-2">
+        <span
+          aria-label="generating LLM rationale"
+          className="mt-1 inline-block h-3 w-3 shrink-0 animate-spin rounded-full border-2 border-slate-300 border-t-slate-600"
+        />
+        <div className="flex-1">
+          <span className="text-slate-400 italic">{row.reasoning}</span>
+          <span className="ml-2 text-[10px] uppercase tracking-wider text-slate-400">generating…</span>
+        </div>
+      </div>
+    )
+  }
+  if (row.rationale_source === 'llm') {
+    return (
+      <div>
+        <span className="text-slate-800">{row.reasoning}</span>
+        {!row.factuality_ok && (
+          <span className="ml-2 rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700">
+            factuality?
+          </span>
+        )}
+      </div>
+    )
+  }
+  // fallback
+  return (
+    <div>
+      <span className="text-slate-700">{row.reasoning}</span>
+      <span className="ml-2 rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider text-slate-500">
+        fallback
+      </span>
+    </div>
+  )
+}
+
+const POLL_INTERVAL_MS = 2000
+
+const SCORE_WEIGHTS: Record<string, number> = {
+  volume: 0.20,
+  recency: 0.15,
+  hs_fit: 0.25,
+  competitive: 0.15,
+  reachability: 0.15,
+  seniority: 0.10,
+}
+
+function fmtTs(ts: number): string {
+  return new Date(ts * 1000).toLocaleTimeString()
+}
+
+function StageHeader({ n, title, badge }: { n: number; title: string; badge?: React.ReactNode }) {
+  return (
+    <div className="mb-1.5 flex items-center gap-2">
+      <span className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-slate-900 text-[10px] font-semibold text-white">
+        {n}
+      </span>
+      <h4 className="text-xs font-semibold uppercase tracking-wider text-slate-700">{title}</h4>
+      {badge}
+    </div>
+  )
+}
+
+function SourceBadge({ source }: { source: string }) {
+  const map: Record<string, { bg: string; fg: string }> = {
+    llm: { bg: 'bg-emerald-100', fg: 'text-emerald-800' },
+    fallback_no_key: { bg: 'bg-slate-200', fg: 'text-slate-700' },
+    fallback_error: { bg: 'bg-amber-100', fg: 'text-amber-800' },
+    fallback_factuality: { bg: 'bg-red-100', fg: 'text-red-800' },
+    pending: { bg: 'bg-slate-100', fg: 'text-slate-500' },
+    fallback: { bg: 'bg-slate-200', fg: 'text-slate-700' },
+  }
+  const c = map[source] ?? { bg: 'bg-slate-100', fg: 'text-slate-600' }
+  return (
+    <span className={`rounded px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider ${c.bg} ${c.fg}`}>
+      {source}
+    </span>
+  )
+}
+
+function KV({ k, v }: { k: string; v: React.ReactNode }) {
+  return (
+    <div className="flex gap-3 py-0.5">
+      <span className="w-44 shrink-0 text-[11px] text-slate-500">{k}</span>
+      <span className="min-w-0 flex-1 font-mono text-[11px] text-slate-800 break-words">{v ?? '—'}</span>
+    </div>
+  )
+}
+
+function TraceExpander({ row, trace, error }: { row: RankedLead; trace: RationaleTrace | null; error: string | null }) {
+  if (error) return <div className="px-4 py-3 text-xs text-red-600">trace error: {error}</div>
+  if (!trace) return <div className="px-4 py-3 text-xs text-slate-500">loading trace…</div>
+
+  const f = row.features as Record<string, unknown>
+  const synced = !!f.is_synced_to_crm
+
+  return (
+    <div className="space-y-5 bg-slate-50 px-5 py-4 text-[11px]">
+      {/* Stage 1: Features */}
+      <div>
+        <StageHeader n={1} title="Features (deterministic extraction)" />
+        <div className="rounded-md border border-slate-200 bg-white p-3">
+          {(['status', 'total_shipments', 'matching_shipments', 'days_since_recent', 'lead_hs_codes', 'top_ports', 'hs_overlap', 'hs_overlap_ratio', 'competitor_count', 'top_competitor_name', 'max_competitor_share_pct', 'contact_count', 'has_email', 'senior_contact_title', 'senior_contact_name'] as const).map((k) => {
+            const v = f[k]
+            const display = Array.isArray(v) ? (v.length ? v.join(', ') : '—') : v === null || v === undefined || v === '' ? '—' : String(v)
+            return <KV key={k} k={k} v={display} />
+          })}
+        </div>
+      </div>
+
+      {/* Stage 2: Scoring */}
+      <div>
+        <StageHeader n={2} title="Scoring (weighted composition)" />
+        <div className="rounded-md border border-slate-200 bg-white p-3">
+          <div className="grid grid-cols-[1fr_60px_60px_80px] gap-x-4 gap-y-1 font-mono">
+            <div className="text-[10px] uppercase tracking-wider text-slate-500">component</div>
+            <div className="text-right text-[10px] uppercase tracking-wider text-slate-500">value</div>
+            <div className="text-right text-[10px] uppercase tracking-wider text-slate-500">× weight</div>
+            <div className="text-right text-[10px] uppercase tracking-wider text-slate-500">= contrib.</div>
+            {Object.entries(row.components).map(([k, v]) => {
+              const w = SCORE_WEIGHTS[k] ?? 0
+              const contrib = v * w
+              return (
+                <React.Fragment key={k}>
+                  <div className="text-slate-700">{k}</div>
+                  <div className="text-right text-slate-700">{v.toFixed(3)}</div>
+                  <div className="text-right text-slate-500">{w.toFixed(2)}</div>
+                  <div className="text-right font-semibold text-slate-900">{contrib.toFixed(3)}</div>
+                </React.Fragment>
+              )
+            })}
+            <div className="col-span-3 border-t border-slate-200 pt-1 text-right text-[10px] uppercase tracking-wider text-slate-500">
+              {synced && 'composite × 0.5 (synced_to_crm penalty) ='}
+              {!synced && 'composite ='}
+            </div>
+            <div className="border-t border-slate-200 pt-1 text-right font-mono font-semibold text-slate-900">{row.score.toFixed(3)}</div>
+          </div>
+        </div>
+      </div>
+
+      {/* Stage 3: LLM prompt */}
+      <div>
+        <StageHeader n={3} title="LLM prompt (input to Claude)" />
+        <div className="space-y-2 rounded-md border border-slate-200 bg-white p-3">
+          <KV k="system_prompt (excerpt)" v={<span className="italic text-slate-600">{trace.system_prompt_excerpt}</span>} />
+          <div>
+            <div className="text-[10px] uppercase tracking-wider text-slate-500">user_payload</div>
+            <pre className="mt-1 whitespace-pre-wrap rounded bg-slate-50 p-2 font-mono text-[10px] leading-relaxed text-slate-700">{trace.user_payload}</pre>
+          </div>
+        </div>
+      </div>
+
+      {/* Stage 4: LLM response */}
+      <div>
+        <StageHeader
+          n={4}
+          title="LLM response"
+          badge={trace.llm ? null : <span className="text-[10px] text-slate-500">(skipped — no API key)</span>}
+        />
+        {trace.llm ? (
+          <div className="rounded-md border border-slate-200 bg-white p-3">
+            <KV k="model" v={trace.llm.model} />
+            <KV k="latency_ms" v={trace.llm.latency_ms} />
+            <KV k="input_tokens" v={trace.llm.input_tokens} />
+            <KV k="output_tokens" v={trace.llm.output_tokens} />
+            <KV k="cache_read_input_tokens" v={trace.llm.cache_read_input_tokens} />
+            <KV k="cache_creation_input_tokens" v={trace.llm.cache_creation_input_tokens} />
+            {trace.llm.error && <KV k="error" v={<span className="text-red-700">{trace.llm.error}</span>} />}
+            {trace.llm.raw_response_text != null && (
+              <div className="mt-2">
+                <div className="text-[10px] uppercase tracking-wider text-slate-500">raw_response_text</div>
+                <pre className="mt-1 whitespace-pre-wrap rounded bg-slate-50 p-2 font-mono text-[10px] leading-relaxed text-slate-700">{trace.llm.raw_response_text}</pre>
+              </div>
+            )}
+          </div>
+        ) : (
+          <div className="rounded-md border border-slate-200 bg-white p-3 text-slate-500">
+            ANTHROPIC_API_KEY not set; pipeline went straight to deterministic fallback.
+          </div>
+        )}
+      </div>
+
+      {/* Stage 5: Factuality */}
+      <div>
+        <StageHeader
+          n={5}
+          title="Factuality check"
+          badge={
+            trace.factuality
+              ? trace.factuality.ok
+                ? <span className="rounded bg-emerald-100 px-1.5 py-0.5 text-[10px] font-medium text-emerald-800">PASS</span>
+                : <span className="rounded bg-red-100 px-1.5 py-0.5 text-[10px] font-medium text-red-800">FAIL</span>
+              : <span className="text-[10px] text-slate-500">(n/a — no LLM call)</span>
+          }
+        />
+        {trace.factuality ? (
+          <div className="rounded-md border border-slate-200 bg-white p-3">
+            <KV k="cited_hs_codes" v={trace.factuality.cited_hs_codes.join(', ') || '—'} />
+            <KV k="invalid_hs_codes" v={trace.factuality.invalid_hs_codes.length ? <span className="text-red-700">{trace.factuality.invalid_hs_codes.join(', ')}</span> : '—'} />
+            <KV k="cited_ports" v={trace.factuality.cited_ports.join(', ') || '—'} />
+            <KV k="cited_competitors" v={trace.factuality.cited_competitors.join(', ') || '—'} />
+            <KV k="cited_titles" v={trace.factuality.cited_titles.join(', ') || '—'} />
+            <KV k="has_anchor" v={String(trace.factuality.has_anchor)} />
+            {trace.factuality.reason && <KV k="reject_reason" v={<span className="text-red-700">{trace.factuality.reason}</span>} />}
+          </div>
+        ) : (
+          <div className="rounded-md border border-slate-200 bg-white p-3 text-slate-500">
+            no LLM call to verify.
+          </div>
+        )}
+      </div>
+
+      {/* Stage 6: Outcome */}
+      <div>
+        <StageHeader n={6} title="Outcome" badge={<SourceBadge source={trace.final_source} />} />
+        <div className="rounded-md border border-slate-200 bg-white p-3">
+          <KV k="final_text" v={<span className="text-slate-900">{trace.final_text}</span>} />
+          {trace.fallback_text && trace.fallback_text !== trace.final_text && (
+            <KV k="fallback_text (alt)" v={<span className="text-slate-600">{trace.fallback_text}</span>} />
+          )}
+          <KV k="generated_at" v={fmtTs(trace.generated_at)} />
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function DeliverablePage() {
-  const [ranked, setRanked] = useState<RankedLead[] | null>(null)
+  const [resp, setResp] = useState<RankedResponse | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [selected, setSelected] = useState<Record<string, boolean>>({})
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({})
+  const [traces, setTraces] = useState<Record<string, RationaleTrace>>({})
+  const [traceErrors, setTraceErrors] = useState<Record<string, string>>({})
 
   useEffect(() => {
-    api.get<RankedLead[]>('/leads/ranked?limit=50')
-      .then(setRanked)
-      .catch((e) => setError(String(e)))
+    let stopped = false
+    let timer: ReturnType<typeof setTimeout> | null = null
+
+    const fetchOnce = () => {
+      api
+        .get<RankedResponse>('/leads/ranked?limit=50')
+        .then((r) => {
+          if (stopped) return
+          setResp(r)
+          if (r.pending_count > 0) {
+            timer = setTimeout(fetchOnce, POLL_INTERVAL_MS)
+          }
+        })
+        .catch((e) => {
+          if (stopped) return
+          setError(String(e))
+        })
+    }
+
+    fetchOnce()
+    return () => {
+      stopped = true
+      if (timer) clearTimeout(timer)
+    }
   }, [])
+
+  const fetchTrace = (leadId: string, force = false) => {
+    if (!force && traces[leadId]) return
+    api
+      .get<RationaleTrace>(`/leads/${leadId}/trace`)
+      .then((t) => setTraces((s) => ({ ...s, [leadId]: t })))
+      .catch((e) => setTraceErrors((s) => ({ ...s, [leadId]: String(e) })))
+  }
+
+  const toggleExpand = (leadId: string, source: RationaleSource) => {
+    setExpanded((s) => {
+      const next = { ...s, [leadId]: !s[leadId] }
+      return next
+    })
+    if (!expanded[leadId] && source !== 'pending') fetchTrace(leadId)
+  }
+
+  useEffect(() => {
+    // When a pending row finishes, refresh its trace if currently expanded.
+    if (!resp) return
+    for (const r of resp.rows) {
+      if (expanded[r.lead_id] && r.rationale_source !== 'pending' && !traces[r.lead_id]) {
+        fetchTrace(r.lead_id)
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [resp])
+
+  const rows = resp?.rows ?? null
+  const pending = resp?.pending_count ?? 0
+  const llmDone = resp ? (resp.stats.llm ?? 0) : 0
+  const fallbackDone = resp ? (resp.stats.fallback ?? 0) : 0
 
   return (
     <div className="flex h-full flex-col gap-4">
@@ -150,18 +494,31 @@ function DeliverablePage() {
         <h2 className="text-lg font-medium tracking-tight">Ranked outreach targets</h2>
         <p className="text-sm text-slate-600">
           Top US importers worth chasing for the factory. Score combines volume, recency, HS-code fit, competitor pressure, reachability, and seniority.
-          <span className="ml-1 italic text-slate-400">(rationale layer stubbed — LLM not wired yet)</span>
         </p>
+        {resp && (
+          <div className="mt-1.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-500">
+            <span>{rows?.length ?? 0} ranked</span>
+            <span className="text-emerald-700">{llmDone} LLM</span>
+            <span className="text-slate-500">{fallbackDone} fallback</span>
+            {pending > 0 && (
+              <span className="flex items-center gap-1.5 text-slate-700">
+                <span className="inline-block h-2.5 w-2.5 animate-spin rounded-full border-2 border-slate-300 border-t-slate-700" />
+                {pending} generating…
+              </span>
+            )}
+          </div>
+        )}
       </div>
 
       {error && <p className="shrink-0 text-red-600">error: {error}</p>}
-      {!error && !ranked && <p className="shrink-0 text-slate-500">loading…</p>}
+      {!error && !rows && <p className="shrink-0 text-slate-500">loading…</p>}
 
-      {ranked && (
+      {rows && (
         <div className="min-h-0 flex-1 overflow-auto rounded-lg border border-slate-200 bg-white shadow-sm">
           <table className="min-w-full text-sm">
             <thead className="sticky top-0 z-10 bg-slate-50 text-slate-600 shadow-sm">
               <tr>
+                <th className="w-8 px-2 py-2 text-left font-medium"></th>
                 <th className="w-12 px-3 py-2 text-left font-medium">✓</th>
                 <th className="w-20 px-3 py-2 text-left font-medium">score</th>
                 <th className="w-64 px-3 py-2 text-left font-medium">company</th>
@@ -170,28 +527,55 @@ function DeliverablePage() {
               </tr>
             </thead>
             <tbody>
-              {ranked.map((r) => (
-                <tr key={r.lead_id} className="border-t border-slate-100 hover:bg-slate-50">
-                  <td className="px-3 py-2 align-top">
-                    <input
-                      type="checkbox"
-                      checked={!!selected[r.lead_id]}
-                      onChange={(e) => setSelected((s) => ({ ...s, [r.lead_id]: e.target.checked }))}
-                      className="h-4 w-4 cursor-pointer accent-slate-900"
-                    />
-                  </td>
-                  <td className="px-3 py-2 align-top font-mono text-slate-900">{r.score.toFixed(3)}</td>
-                  <td className="px-3 py-2 align-top font-medium text-slate-900">{r.company}</td>
-                  <td className="px-3 py-2 align-top">
-                    <div className="space-y-0.5">
-                      {Object.entries(r.components).map(([k, v]) => (
-                        <ComponentBar key={k} name={k} value={v} />
-                      ))}
-                    </div>
-                  </td>
-                  <td className="px-3 py-2 align-top text-slate-700">{r.reasoning}</td>
-                </tr>
-              ))}
+              {rows.map((r) => {
+                const isOpen = !!expanded[r.lead_id]
+                return (
+                  <React.Fragment key={r.lead_id}>
+                    <tr
+                      className={
+                        'border-t border-slate-100 cursor-pointer ' +
+                        (isOpen ? 'bg-slate-50' : 'hover:bg-slate-50')
+                      }
+                      onClick={() => toggleExpand(r.lead_id, r.rationale_source)}
+                    >
+                      <td className="px-2 py-2 align-top text-slate-400">
+                        <span className="inline-block w-3 select-none">{isOpen ? '▾' : '▸'}</span>
+                      </td>
+                      <td className="px-3 py-2 align-top" onClick={(e) => e.stopPropagation()}>
+                        <input
+                          type="checkbox"
+                          checked={!!selected[r.lead_id]}
+                          onChange={(e) => setSelected((s) => ({ ...s, [r.lead_id]: e.target.checked }))}
+                          className="h-4 w-4 cursor-pointer accent-slate-900"
+                        />
+                      </td>
+                      <td className="px-3 py-2 align-top font-mono text-slate-900">{r.score.toFixed(3)}</td>
+                      <td className="px-3 py-2 align-top font-medium text-slate-900">{r.company}</td>
+                      <td className="px-3 py-2 align-top">
+                        <div className="space-y-0.5">
+                          {Object.entries(r.components).map(([k, v]) => (
+                            <ComponentBar key={k} name={k} value={v} />
+                          ))}
+                        </div>
+                      </td>
+                      <td className="px-3 py-2 align-top">
+                        <RationaleCell row={r} />
+                      </td>
+                    </tr>
+                    {isOpen && (
+                      <tr key={r.lead_id + ':trace'} className="border-t border-slate-100">
+                        <td colSpan={6} className="p-0">
+                          <TraceExpander
+                            row={r}
+                            trace={traces[r.lead_id] ?? null}
+                            error={traceErrors[r.lead_id] ?? null}
+                          />
+                        </td>
+                      </tr>
+                    )}
+                  </React.Fragment>
+                )
+              })}
             </tbody>
           </table>
         </div>
@@ -199,7 +583,6 @@ function DeliverablePage() {
 
       <div className="shrink-0 text-xs text-slate-500">
         {Object.values(selected).filter(Boolean).length} selected for outreach
-        {ranked && <span className="ml-3">· {ranked.length} ranked</span>}
       </div>
     </div>
   )
@@ -599,10 +982,152 @@ function AdjacencyList({ edges }: { edges: Shipment[] }) {
   )
 }
 
+const EVENT_KIND_COLOR: Record<string, string> = {
+  ingest: 'bg-sky-100 text-sky-800',
+  persona_inferred: 'bg-indigo-100 text-indigo-800',
+  ranking_request: 'bg-slate-200 text-slate-700',
+  batch_dispatched: 'bg-amber-100 text-amber-800',
+  batch_complete: 'bg-emerald-100 text-emerald-800',
+  llm_call: 'bg-violet-100 text-violet-800',
+  factuality_fail: 'bg-red-100 text-red-800',
+  fallback: 'bg-slate-200 text-slate-700',
+  cache_cleared: 'bg-slate-100 text-slate-600',
+}
+
+function EventKindBadge({ kind }: { kind: string }) {
+  const c = EVENT_KIND_COLOR[kind] ?? 'bg-slate-100 text-slate-600'
+  return (
+    <span className={`rounded px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider ${c}`}>
+      {kind}
+    </span>
+  )
+}
+
+function EventRow({ ev }: { ev: TraceEvent }) {
+  const [open, setOpen] = useState(false)
+  const hasPayload = ev.payload && Object.keys(ev.payload).length > 0
+  return (
+    <>
+      <tr
+        className={
+          'border-t border-slate-100 ' +
+          (hasPayload ? 'cursor-pointer hover:bg-slate-50' : '')
+        }
+        onClick={() => hasPayload && setOpen((o) => !o)}
+      >
+        <td className="w-12 px-3 py-1.5 align-top font-mono text-[11px] text-slate-400">{ev.seq}</td>
+        <td className="w-20 px-3 py-1.5 align-top font-mono text-[11px] text-slate-500">{fmtTs(ev.ts)}</td>
+        <td className="w-44 px-3 py-1.5 align-top">
+          <EventKindBadge kind={ev.kind} />
+        </td>
+        <td className="px-3 py-1.5 align-top text-sm text-slate-800">
+          {hasPayload && (
+            <span className="mr-1.5 inline-block w-3 select-none text-slate-400">{open ? '▾' : '▸'}</span>
+          )}
+          {ev.summary}
+        </td>
+      </tr>
+      {open && hasPayload && (
+        <tr className="border-t border-slate-100 bg-slate-50">
+          <td colSpan={4} className="px-12 py-2">
+            <pre className="overflow-x-auto whitespace-pre-wrap rounded bg-white p-2 font-mono text-[10px] leading-relaxed text-slate-700 ring-1 ring-slate-200">
+              {JSON.stringify(ev.payload, null, 2)}
+            </pre>
+          </td>
+        </tr>
+      )}
+    </>
+  )
+}
+
+const EVENTS_POLL_MS = 2000
+
+function TracePage() {
+  const [data, setData] = useState<EventsResponse | null>(null)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    let stopped = false
+    let timer: ReturnType<typeof setTimeout> | null = null
+
+    const tick = () => {
+      api
+        .get<EventsResponse>('/ranking/events')
+        .then((d) => {
+          if (stopped) return
+          setData(d)
+          timer = setTimeout(tick, EVENTS_POLL_MS)
+        })
+        .catch((e) => {
+          if (stopped) return
+          setError(String(e))
+        })
+    }
+
+    tick()
+    return () => {
+      stopped = true
+      if (timer) clearTimeout(timer)
+    }
+  }, [])
+
+  const events = data?.events ?? []
+  // newest first for readability
+  const sorted = [...events].sort((a, b) => b.seq - a.seq)
+
+  return (
+    <div className="flex h-full flex-col gap-4">
+      <div className="shrink-0">
+        <h2 className="text-lg font-medium tracking-tight">Pipeline trace</h2>
+        <p className="text-sm text-slate-600">
+          System-level events across ingest, persona inference, ranking requests, and LLM batches.
+          Click a row to inspect the event payload. For per-lead audit, expand a row on the Deliverable page.
+        </p>
+        {data && (
+          <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-600">
+            <span>{events.length} events</span>
+            <span>{data.trace_count} per-lead traces cached</span>
+            <span className="text-emerald-700">{data.cache_stats.llm ?? 0} llm</span>
+            <span className="text-slate-500">{data.cache_stats.fallback ?? 0} fallback</span>
+            <span className="text-amber-700">{data.cache_stats.pending ?? 0} pending</span>
+          </div>
+        )}
+      </div>
+
+      {error && <p className="shrink-0 text-red-600">error: {error}</p>}
+      {!error && !data && <p className="shrink-0 text-slate-500">loading…</p>}
+
+      {data && (
+        <div className="min-h-0 flex-1 overflow-auto rounded-lg border border-slate-200 bg-white shadow-sm">
+          <table className="min-w-full text-sm">
+            <thead className="sticky top-0 z-10 bg-slate-50 text-slate-600 shadow-sm">
+              <tr>
+                <th className="w-12 px-3 py-2 text-left text-[11px] font-medium uppercase tracking-wider">seq</th>
+                <th className="w-20 px-3 py-2 text-left text-[11px] font-medium uppercase tracking-wider">time</th>
+                <th className="w-44 px-3 py-2 text-left text-[11px] font-medium uppercase tracking-wider">kind</th>
+                <th className="px-3 py-2 text-left text-[11px] font-medium uppercase tracking-wider">summary</th>
+              </tr>
+            </thead>
+            <tbody>
+              {sorted.length === 0 && (
+                <tr>
+                  <td colSpan={4} className="px-3 py-6 text-center text-slate-400">no events yet</td>
+                </tr>
+              )}
+              {sorted.map((ev) => <EventRow key={ev.seq} ev={ev} />)}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  )
+}
+
 const PAGE_LABEL: Record<Page, string> = {
   deliverable: 'Deliverable',
   tables: 'Tables',
   graph: 'Graph',
+  trace: 'Trace',
 }
 
 function App() {
@@ -614,7 +1139,7 @@ function App() {
         <div className="mx-auto flex max-w-350 items-center justify-between px-6 py-3">
           <h1 className="text-base font-semibold tracking-tight">Prelude Case Study</h1>
           <nav className="flex gap-1">
-            {(['deliverable', 'tables', 'graph'] as Page[]).map((p) => (
+            {(['deliverable', 'tables', 'graph', 'trace'] as Page[]).map((p) => (
               <button
                 key={p}
                 onClick={() => setPage(p)}
@@ -637,6 +1162,7 @@ function App() {
           {page === 'deliverable' && <DeliverablePage />}
           {page === 'tables' && <TablesPage />}
           {page === 'graph' && <GraphPage />}
+          {page === 'trace' && <TracePage />}
         </div>
       </main>
     </div>

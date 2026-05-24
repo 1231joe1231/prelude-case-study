@@ -134,3 +134,30 @@ Single page, single table. Columns: company, score, reasoning, checkbox. No filt
 - Frontend uses Tailwind v4 via `@tailwindcss/vite` plugin — no `tailwind.config.js`, classes are in the JSX.
 - Vite dev proxy means frontend always calls `/api/...` (never absolute URLs).
 - SQLite file at `backend/data.db` is the demo store. Safe to delete and re-ingest.
+
+## Deferred design: input versioning + golden dataset
+
+**Not built yet — capture intent for a future phase.**
+
+Goal: be able to switch the backend between the **real** CSVs (current 121/120/30) and a **golden** dataset (hand-crafted small set with known-correct ranking). The golden set lets eval tests assert exact expected output. Switching back to real CSVs runs the actual demo.
+
+Planned shape:
+```
+backend/input/
+  real/                  # current 121 leads, 120 personnel, 30 competitors
+    leads.csv
+    personnel.csv
+    bol_competitors.csv
+  golden/                # ~10 leads, ~10 personnel, ~5 competitors, hand-crafted
+    leads.csv
+    personnel.csv
+    bol_competitors.csv
+```
+
+- Env var `INPUT_VERSION=real|golden` (default `real`) selects which subdir `ingest.py` reads.
+- Eval pytest tests set `INPUT_VERSION=golden` and assert exact ranking output (e.g., "lead X must be #1").
+- Real run = default.
+- Golden CSVs must follow same column layout as real CSVs (no headers, same column order) so the same ingest code works without branching.
+- Build the golden set by hand from inspecting the real data: pick ~5 obvious "high score" leads (good HS overlap, recent volume, has senior contact, low competitor pressure) and ~5 obvious "low" (no email, no shipments, or `not_interested`).
+
+When implementing: refactor `INPUT_DIR` in `backend/app/ingest.py` to read `os.environ.get("INPUT_VERSION", "real")` and join. No other code changes needed since downstream tables are identical.

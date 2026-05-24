@@ -14,6 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..models import CompetitorAttribute
+from .trace import emit
 
 DEFAULT_TOP_N = 8
 
@@ -32,7 +33,16 @@ def infer_persona(db: Session, top_n: int = DEFAULT_TOP_N) -> Persona:
         select(CompetitorAttribute.value).where(CompetitorAttribute.kind == "hs_code")
     ).all()
     counts = Counter(v for v in rows if v)
-    top = [code for code, _ in counts.most_common(top_n)]
+    top_with_counts = counts.most_common(top_n)
+    top = [code for code, _ in top_with_counts]
+    emit(
+        "persona_inferred",
+        f"Persona HS profile: {', '.join(top)}",
+        top_n=top_n,
+        hs_codes=top,
+        counts={code: cnt for code, cnt in top_with_counts},
+        total_distinct=len(counts),
+    )
     return Persona(
         hs_codes=frozenset(top),
         hs_code_ranks={code: i for i, code in enumerate(top)},

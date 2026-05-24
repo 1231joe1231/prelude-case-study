@@ -1,23 +1,36 @@
-"""Ranking endpoint: deterministic feature pipeline + score + (stubbed) LLM rationale."""
+"""Ranking endpoint: deterministic pipeline + LLM rationale (background-upgraded).
+
+The endpoint returns immediately with a fallback rationale per lead and kicks
+off an async LLM batch for any leads not yet cached. The frontend polls the
+same endpoint every ~2s; each call merges the latest cache state.
+`rationale_source` per row drives the UI indicator:
+
+  pending  → fallback shown + spinner
+  llm      → LLM rationale, factuality-verified
+  fallback → deterministic synth (no key, LLM error, or factuality failure)
+
+When `stats.pending` reaches 0, the frontend stops polling.
+"""
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from ..db import get_db
+from ..ranking.cache import get_or_kick, stats as cache_stats
 from ..ranking.features import extract_all
 from ..ranking.persona import get_persona
-from ..ranking.rationale import rationalize
-from ..ranking.score import score_lead
+from ..ranking.score import WEIGHTS, score_lead
+from ..ranking.trace import emit, events_since, get_trace, trace_count
 
 router = APIRouter(prefix="/leads", tags=["ranking"])
 
 
 @router.get("/ranked")
-def get_ranked(
+async def get_ranked(
     limit: int = Query(50, ge=1, le=500),
     db: Session = Depends(get_db),
-) -> list[dict]:
+) -> dict:
     persona = get_persona(db)
     all_features = extract_all(db, persona)
 
@@ -31,18 +44,38 @@ def get_ranked(
     scored.sort(key=lambda x: x[1], reverse=True)
     top = scored[:limit]
 
-    return [
-        {
+    emit(
+        "ranking_request",
+        f"/ranked limit={limit} → returning top {len(top)} of {len(scored)} eligible",
+        limit=limit,
+        returned=len(top),
+        eligible=len(scored),
+        filtered_not_interested=len(all_features) - len(scored),
+    )
+
+    # Seed cache + kick off background LLM batch for any uncached leads
+    cache_snapshot = await get_or_kick([(f, c) for f, _, c in top])
+
+    rows = []
+    for f, composite, components in top:
+        cached = cache_snapshot.get(f.lead_id)
+        rows.append({
             "lead_id": f.lead_id,
             "company": f.company,
             "score": round(composite, 4),
             "components": {k: round(v, 4) for k, v in components.items()},
             "features": f.to_dict(),
-            "reasoning": rationalize(f, components),
+            "reasoning": cached.text if cached else "",
+            "rationale_source": cached.source if cached else "fallback",
+            "factuality_ok": cached.factuality_ok if cached else False,
             "selected": False,
-        }
-        for f, composite, components in top
-    ]
+        })
+
+    return {
+        "rows": rows,
+        "stats": cache_stats(),
+        "pending_count": sum(1 for r in rows if r["rationale_source"] == "pending"),
+    }
 
 
 @router.get("/persona")
@@ -52,4 +85,46 @@ def get_factory_persona(db: Session = Depends(get_db)) -> dict:
     return {
         "hs_codes": sorted(p.hs_codes),
         "ranks": p.hs_code_ranks,
+    }
+
+
+@router.get("/{lead_id}/trace")
+def get_lead_trace(lead_id: str) -> dict:
+    """Per-lead full pipeline trace: features payload, LLM prompt, raw response,
+    factuality check, fallback used (if any). Populated by the rationale cache;
+    returns 404 if /leads/ranked hasn't been called yet for this lead.
+
+    The trace is the auditability surface: every claim in the displayed
+    rationale traces back to a literal value in the source data.
+    """
+    t = get_trace(lead_id)
+    if t is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"no trace for lead_id={lead_id}; call /api/leads/ranked first",
+        )
+    return t.to_dict()
+
+
+# Sibling router under /ranking for system-level introspection.
+ranking_router = APIRouter(prefix="/ranking", tags=["ranking"])
+
+
+@ranking_router.get("/events")
+def get_events(since_seq: int = Query(0, ge=0), limit: int = Query(200, ge=1, le=500)) -> dict:
+    """Global pipeline event stream.
+
+    Cross-lead events emitted by the pipeline: ingest, persona inference,
+    batch dispatch/complete, individual LLM calls, factuality failures.
+    Frontend polls with ?since_seq=<last_seen> to stream new events.
+    """
+    evs = events_since(since_seq=since_seq, limit=limit)
+    return {
+        "events": [
+            {"seq": e.seq, "ts": e.ts, "kind": e.kind, "summary": e.summary, "payload": e.payload}
+            for e in evs
+        ],
+        "trace_count": trace_count(),
+        "cache_stats": cache_stats(),
+        "weights": WEIGHTS,
     }
