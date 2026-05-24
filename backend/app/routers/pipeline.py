@@ -52,9 +52,7 @@ async def switch_input(body: SwitchInputBody, background: BackgroundTasks) -> di
         raise HTTPException(400, f"version must be one of {sorted(VALID_VERSIONS)}")
 
     async with pstate.run_lock():
-        if pstate.get_state().stage in {"ingesting", "persona_inferring",
-                                        "feature_extracting", "scoring",
-                                        "llm_batching"}:
+        if pstate.get_state().stage in {"ingesting", "llm_batching"}:
             raise HTTPException(409, "pipeline busy; wait for it to complete")
 
     background.add_task(_reingest, body.version)
@@ -110,6 +108,10 @@ async def run_pipeline(body: RunBody) -> dict:
 
 
 async def _run_pipeline_async(limit: int) -> None:
+    """Compute top-N then fan out LLM rationales. Persona + feature extraction
+    + scoring run inline (sub-100ms on 121 leads) so they don't get their own
+    stage — they're effectively part of preparing the batch. The only stage
+    the operator notices is `llm_batching`."""
     async with pstate.run_lock():
         started = time.time()
         emit("ranking_request", f"Pipeline run kicked off (limit={limit})",
@@ -117,13 +119,8 @@ async def _run_pipeline_async(limit: int) -> None:
         try:
             session = SessionLocal()
             try:
-                pstate.set_stage("persona_inferring", last_started_at=started, error=None)
                 persona = get_persona(session)
-
-                pstate.set_stage("feature_extracting")
                 all_features = extract_all(session, persona)
-
-                pstate.set_stage("scoring")
                 scored = [(f, *score_lead(f)) for f in all_features]
                 scored.sort(key=lambda x: x[1], reverse=True)
                 pstate.set_scored_count(len(scored))
@@ -131,7 +128,8 @@ async def _run_pipeline_async(limit: int) -> None:
             finally:
                 session.close()
 
-            pstate.begin_llm_batch(total=len(top), started_at=time.time())
+            # begin_llm_batch flips stage → 'llm_batching' and resets counters.
+            pstate.begin_llm_batch(total=len(top), started_at=started)
             # get_or_kick seeds pending placeholders + spawns the background
             # batch worker. cache._run_batch ticks pstate per completed lead
             # and calls pstate.finish() at the end.

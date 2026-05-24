@@ -6,17 +6,18 @@ the ingest path, the persona/features/scoring path, and the LLM cache
 worker — all funnel through `set_stage()` / `tick_llm()` so the frontend
 sees one consistent state.
 
-Stages (linear, but each is independent — frontend renders them as steps):
+Stages (linear, frontend renders them as steps):
 
   idle               nothing running
-  ingesting          re-reading CSVs into SQLite
-  ingested           CSVs in DB; ready for pipeline run
-  persona_inferring  building HS-code persona from competitor_attributes
-  feature_extracting per-lead feature payload (volume / hs_overlap / contacts / ...)
-  scoring            weighted composite score per lead
+  ingesting          re-reading CSVs into SQLite (a few seconds)
+  ingested           CSVs in DB; deterministic scoring is ready instantly
   llm_batching       generating rationales for top-N (progress = done / total)
-  complete           cache fully populated; /leads/ranked is ready to serve
+  complete           cache fully populated; ready to serve
   error              any stage raised; check `error` field
+
+Persona inference, feature extraction, and scoring are deliberately NOT
+separate stages — they run inline in /api/leads/ranked GETs and take
+sub-100ms on 121 leads. Surfacing them as visible steps would be theater.
 
 `input_version` and `ingest_counts` are kept in the same state object so the
 frontend has a single source of truth for what's loaded + what stage.
@@ -28,16 +29,17 @@ import threading
 from dataclasses import asdict, dataclass, field
 from typing import Literal
 
+# Honest stage set: only operations that take human-noticeable time are
+# surfaced. Persona inference + feature extraction + scoring all run inline
+# in /api/leads/ranked GETs (sub-100ms on 121 leads) so they're not separate
+# stages — they're effectively free side-effects of reading SQLite.
 Stage = Literal[
-    "idle",
-    "ingesting",
-    "ingested",
-    "persona_inferring",
-    "feature_extracting",
-    "scoring",
-    "llm_batching",
-    "complete",
-    "error",
+    "idle",          # process just started; no ingest yet
+    "ingesting",     # re-reading CSVs into SQLite (a few seconds)
+    "ingested",      # data loaded; deterministic scoring is ready instantly
+    "llm_batching",  # generating rationales for top-N (the only real work)
+    "complete",      # cache populated; ready to serve
+    "error",         # check `error` field
 ]
 
 

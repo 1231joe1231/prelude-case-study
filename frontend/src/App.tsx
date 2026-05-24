@@ -140,9 +140,6 @@ type PipelineStage =
   | 'idle'
   | 'ingesting'
   | 'ingested'
-  | 'persona_inferring'
-  | 'feature_extracting'
-  | 'scoring'
   | 'llm_batching'
   | 'complete'
   | 'error'
@@ -1173,18 +1170,16 @@ function TracePage() {
   )
 }
 
+// Only operations with human-noticeable duration are surfaced.
+// Persona/features/scoring run inline in /ranked (sub-100ms) — not stages.
 const STAGE_ORDER: PipelineStage[] = [
-  'ingesting', 'ingested', 'persona_inferring',
-  'feature_extracting', 'scoring', 'llm_batching', 'complete',
+  'ingesting', 'ingested', 'llm_batching', 'complete',
 ]
 
 const STAGE_LABEL: Record<PipelineStage, string> = {
   idle: 'Idle',
   ingesting: 'Ingesting CSVs',
   ingested: 'Ingested (ready)',
-  persona_inferring: 'Inferring persona',
-  feature_extracting: 'Extracting features',
-  scoring: 'Scoring',
   llm_batching: 'LLM rationales',
   complete: 'Complete',
   error: 'Error',
@@ -1263,9 +1258,7 @@ function BusyBar({ busy }: { busy: boolean }) {
   )
 }
 
-const BUSY_STAGES: PipelineStage[] = [
-  'ingesting', 'persona_inferring', 'feature_extracting', 'scoring', 'llm_batching',
-]
+const BUSY_STAGES: PipelineStage[] = ['ingesting', 'llm_batching']
 
 function PipelinePage() {
   const [status, setStatus] = useState<PipelineStatus | null>(null)
@@ -1338,7 +1331,7 @@ function PipelinePage() {
 
   const runPipeline = async () => {
     setPendingOp('run')
-    setOptimisticStage('persona_inferring')
+    setOptimisticStage('llm_batching')
     setError(null)
     try {
       await api.post('/pipeline/run', { limit })
