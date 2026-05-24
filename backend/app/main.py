@@ -13,7 +13,7 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 from .db import Base, SessionLocal, engine
 from .ingest import ingest_all
-from .pipeline import state as pstate
+from .pipeline import selection, state as pstate
 from .ranking.cache import clear_cache as clear_rationale_cache
 from .ranking.persona import clear_cache as clear_persona_cache
 from .ranking.trace import clear_events, clear_traces, emit
@@ -40,6 +40,7 @@ async def lifespan(app: FastAPI):
         clear_persona_cache()
         clear_rationale_cache()
         clear_traces()
+        selection.clear()
         log.info("startup ingest complete (version=%s): %s", version, counts)
         emit("ingest",
              f"Startup ingest (version={version!r}): {counts.get('leads', 0)} leads / "

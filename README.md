@@ -45,23 +45,6 @@ The composite is finally clamped to [0, 1].
 | **recency** | ± | freshness of last shipment | +1 if last shipment ≤30 days ago, linear to −1 at ≥180 days. **None / missing → 0 (no opinion).** |
 | **concentration** | − | is the lead locked into one supplier? | 0 if top supplier holds <30% of the lead's BOL volume; ramps up to 1 as share climbs toward 100%. Multiplied by a negative weight, so high share *subtracts* from the composite. |
 
-### Why competitor presence is a *positive* signal (and dominance is the negative one)
-
-The earlier model collapsed all competitor information into a single "competitive pressure" signal where *more competitors = worse*. That's wrong twice over:
-
-1. **Presence of a competitor on a lead is a qualified-buyer signal.** They've proven they import this category. Selling to a proven buyer is easier than convincing a cold importer the category matters.
-2. **The actual obstacle is concentration**, not count. A lead split across 5 suppliers (each 20%) is an open market; a lead where one supplier holds 80% is locked in.
-
-So the new model splits the original `competitive` into two:
-- `demand_validated` — binary positive signal, fires when any competitor edge exists
-- `concentration` — magnitude penalty, only kicks in when the top supplier's share exceeds 30%
-
-### Why missing data contributes zero
-
-Earlier weights for `recency` and `competitive` were forced to 0 because the source data was sparse — 16 of 121 leads have a usable `most_recent_shipment`, and only 5 of the top 50 have any resolved competitor edges. The old formula treated missing recency as "ancient" (penalty) and missing competitor count as "uncontested" (bonus), which punished and rewarded *data gaps* instead of actual badness or goodness.
-
-The new model lets `recency` and `concentration` contribute zero when their data is `None`. The composite simply relies on the signals we do have. Once source coverage improves, the same weights start producing meaningful signed contributions without code changes.
-
 ### Status semantics
 
 - `synced_to_crm` is the *default* in this dataset — every active lead is already in the CRM. It is not a negative signal and the rationale never criticizes it.
@@ -102,8 +85,6 @@ The architecture is designed so the LLM is never on the critical scaling path. T
 
 ## Closing the feedback loop
 
-The brief asks how operator feedback (the `status` column) closes the loop. The pieces:
-
 1. **Capture every selection.** When the operator ticks "selected for outreach," persist that decision alongside the feature snapshot the lead had at the moment of decision. These are supervised labels in disguise.
 2. **Re-fit weights from labels.** Once ~200 selections accumulate, fit a simple regression over the six signal scores against whether the lead was selected within 7 days. The new weights replace the hand-set ones; old and new can be A/B'd by version.
 3. **Watch for drift.** When the factuality failure rate climbs or the rank-vs-selection correlation drops, alert. The loop closes itself.
@@ -119,6 +100,7 @@ The pieces are in place to do this — selections happen in the UI, every featur
 - **`synced_to_crm`** is the baseline state in this dataset (every eligible lead carries it), so penalizing it would suppress everyone. Treated as neutral.
 - **`not_interested`** = previously declined, not dead. Soft 0.4× penalty, not a filter.
 - **The rationale cache** lives in memory and is cleared on restart. The brief asks for no persistence beyond the demo; this satisfies it.
+- **The operator-facing surface is the Deliverable tab.** The brief asks for "a single page: a ranked table". The Pipeline / Tables / Graph / Trace tabs are auditability and debug surfaces, not operator workflow — they exist so a reviewer (or the operator on a bad day) can answer "where did this score come from?" without reading code. Brief's out-of-scope list specifically bars "filters, search, lead detail pages, charts"; none of the extra tabs adds operator-facing filtering or analytics, and the Graph tab is a debug visualization of shipping-graph FK resolution, not a customer-facing chart.
 
 ## Stack and run
 

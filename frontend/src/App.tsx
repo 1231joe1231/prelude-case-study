@@ -458,7 +458,10 @@ function TraceExpander({ row, trace, error }: { row: RankedLead; trace: Rational
 function DeliverablePage() {
   const [resp, setResp] = useState<RankedResponse | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const [selected, setSelected] = useState<Record<string, boolean>>({})
+  // Local optimistic override: keyed by lead_id. Wins over server state for
+  // ~1 poll cycle so the checkbox feels instant. Cleared on next poll once
+  // server confirms.
+  const [selectedOverride, setSelectedOverride] = useState<Record<string, boolean>>({})
   const [expanded, setExpanded] = useState<Record<string, boolean>>({})
   const [traces, setTraces] = useState<Record<string, RationaleTrace>>({})
   const [traceErrors, setTraceErrors] = useState<Record<string, string>>({})
@@ -473,6 +476,16 @@ function DeliverablePage() {
         .then((r) => {
           if (stopped) return
           setResp(r)
+          // Drop overrides that the server now agrees with; keep ones still
+          // in flight so we don't flicker back to the old value mid-roundtrip.
+          setSelectedOverride((cur) => {
+            const next: Record<string, boolean> = {}
+            for (const [lid, v] of Object.entries(cur)) {
+              const row = r.rows.find((x) => x.lead_id === lid)
+              if (row && row.selected !== v) next[lid] = v
+            }
+            return next
+          })
           // Fast 2s poll while a batch is in flight (pending > 0).
           // Slow 5s poll otherwise so we catch pipeline runs triggered from
           // the Pipeline tab without burning requests if operator just sits here.
@@ -525,6 +538,28 @@ function DeliverablePage() {
   const llmDone = resp ? (resp.stats.llm ?? 0) : 0
   const fallbackDone = resp ? (resp.stats.fallback ?? 0) : 0
   const noneGenerated = resp && notGenerated === rows?.length
+  const selectedCount = rows
+    ? rows.reduce((n, r) => {
+        const isSel = selectedOverride[r.lead_id] !== undefined
+          ? selectedOverride[r.lead_id]
+          : r.selected
+        return n + (isSel ? 1 : 0)
+      }, 0)
+    : 0
+
+  const toggleSelected = (leadId: string, next: boolean) => {
+    // Optimistic update — server sync confirms on next poll.
+    setSelectedOverride((s) => ({ ...s, [leadId]: next }))
+    api.post(`/leads/${leadId}/select`, { selected: next })
+      .catch((e) => {
+        // Roll back override on server reject so the checkbox flips back.
+        setSelectedOverride((s) => {
+          const { [leadId]: _, ...rest } = s
+          return rest
+        })
+        setError(`failed to ${next ? 'select' : 'deselect'} ${leadId}: ${e}`)
+      })
+  }
 
   return (
     <div className="flex h-full flex-col gap-4">
@@ -591,8 +626,12 @@ function DeliverablePage() {
                       <td className="px-3 py-2 align-top" onClick={(e) => e.stopPropagation()}>
                         <input
                           type="checkbox"
-                          checked={!!selected[r.lead_id]}
-                          onChange={(e) => setSelected((s) => ({ ...s, [r.lead_id]: e.target.checked }))}
+                          checked={
+                            selectedOverride[r.lead_id] !== undefined
+                              ? selectedOverride[r.lead_id]
+                              : r.selected
+                          }
+                          onChange={(e) => toggleSelected(r.lead_id, e.target.checked)}
                           className="h-4 w-4 cursor-pointer accent-slate-900"
                         />
                       </td>
@@ -629,7 +668,7 @@ function DeliverablePage() {
       )}
 
       <div className="shrink-0 text-xs text-slate-500">
-        {Object.values(selected).filter(Boolean).length} selected for outreach
+        {selectedCount} selected for outreach
       </div>
     </div>
   )

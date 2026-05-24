@@ -22,7 +22,7 @@ from sqlalchemy.orm import Session
 
 from ..db import Base, SessionLocal, engine, get_db
 from ..ingest import ingest_all
-from ..pipeline import state as pstate
+from ..pipeline import selection, state as pstate
 from ..ranking.cache import clear_cache as clear_rationale_cache, get_or_kick
 from ..ranking.features import extract_all
 from ..ranking.persona import clear_cache as clear_persona_cache, get_persona
@@ -70,6 +70,7 @@ def _reingest(version: str) -> None:
         clear_persona_cache()
         clear_rationale_cache()
         clear_traces()
+        selection.clear()  # operator selections are tied to the previous dataset
         # Don't clear events — keep history across switches so the Trace tab
         # shows the switch event too.
         session = SessionLocal()

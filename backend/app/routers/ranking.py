@@ -14,9 +14,12 @@ Frontend should show a "Run pipeline first" message when most rows report
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from ..db import get_db
+from ..models import Lead
+from ..pipeline import selection
 from ..ranking.cache import get_cached, stats as cache_stats
 from ..ranking.features import extract_all
 from ..ranking.persona import get_persona
@@ -61,7 +64,7 @@ def get_ranked(
             "reasoning": text,
             "rationale_source": src,
             "factuality_ok": fact_ok,
-            "selected": False,
+            "selected": selection.is_selected(f.lead_id),
         })
         row_stats[src] = row_stats.get(src, 0) + 1
 
@@ -84,6 +87,34 @@ def get_factory_persona(db: Session = Depends(get_db)) -> dict:
         "hs_codes": sorted(p.hs_codes),
         "ranks": p.hs_code_ranks,
     }
+
+
+class SelectBody(BaseModel):
+    selected: bool
+
+
+@router.post("/{lead_id}/select")
+def select_lead(lead_id: str, body: SelectBody, db: Session = Depends(get_db)) -> dict:
+    """Mark / un-mark a lead as selected for outreach.
+
+    Stored in a process-local set so the checkbox state survives tab switches
+    and page reloads within a single backend session. Cleared on re-ingest
+    and on backend restart (brief: no persistence beyond demo).
+
+    Validates that lead_id exists in the DB — prevents typos from polluting
+    the selection store.
+    """
+    exists = db.query(Lead.id).filter(Lead.id == lead_id).first()
+    if not exists:
+        raise HTTPException(status_code=404, detail=f"lead_id {lead_id!r} not found")
+    selection.set_selected(lead_id, body.selected)
+    return {"lead_id": lead_id, "selected": body.selected}
+
+
+@router.get("/selected")
+def list_selected() -> dict:
+    """Return all lead_ids currently selected for outreach."""
+    return {"selected_lead_ids": sorted(selection.all_selected())}
 
 
 @router.get("/{lead_id}/trace")

@@ -80,14 +80,47 @@ def test_persona_includes_christmas_codes(db_session):
 
 # ---------- scenario assertions ----------
 
-def test_perfect_greenfield_is_top(db_session):
-    """GOLD-001 (4/4 HS, 300 ships, recent, senior, 0 competitors, synced) must rank #1.
+def test_validated_demand_outranks_greenfield(db_session):
+    """GOLD-002 (PERFECT_CONTESTED, 5 known competitors) must rank above
+    GOLD-001 (PERFECT_GREENFIELD, 0 competitors) despite GOLD-001 having
+    a slightly stronger raw signal (4/4 HS vs 3/3, 300 ships vs 250).
 
-    This is the canonical 'no excuses' lead. Any change that pushes it off #1
-    is a serious regression.
+    The scoring reframe of the 'competitive' signal is the architectural
+    bet here: presence of competitors PROVES this lead buys the product
+    category from China, i.e. demand is validated. Zero-competitor leads
+    might be greenfield, but they might also just be data gaps. Demand
+    validation is worth the +0.10 weight it carries.
+
+    A previous version of this test asserted GOLD-001 == #1; that
+    assumption predates the demand_validated signal and is now wrong.
     """
     ranked = _ranked(db_session)
-    assert _rank_of(ranked, "GOLD-001") == 1
+    rank_001 = _rank_of(ranked, "GOLD-001")
+    rank_002 = _rank_of(ranked, "GOLD-002")
+    assert rank_002 < rank_001, (
+        f"demand-validated lead must outrank greenfield: "
+        f"GOLD-002 is #{rank_002}, GOLD-001 is #{rank_001}"
+    )
+    # GOLD-002 should specifically be #1 on the golden set — nothing else
+    # combines hs_fit=1.0, validated demand, low concentration, recent activity,
+    # and reachable senior contact.
+    assert rank_002 == 1, f"GOLD-002 should be #1, got #{rank_002}"
+
+
+def test_dominant_competitor_penalized_vs_split_market(db_session):
+    """GOLD-003 (DOMINANT_COMPETITOR, 1 supplier at 80% share) must rank
+    BELOW GOLD-002 (5 competitors splitting volume).
+
+    Both leads have validated demand (demand_validated=1) and strong HS
+    overlap. The discriminator is concentration: a single locked-in
+    supplier at 80% share triggers the negative concentration penalty,
+    while a 5-way split has concentration ≈ 0. If this fails, the
+    concentration signal isn't doing real work.
+    """
+    ranked = _ranked(db_session)
+    assert _rank_of(ranked, "GOLD-002") < _rank_of(ranked, "GOLD-003"), (
+        "split-market lead must outrank dominant-supplier lead"
+    )
 
 
 def test_not_interested_weak_is_bottom(db_session):
