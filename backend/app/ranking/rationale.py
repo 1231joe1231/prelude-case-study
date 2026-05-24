@@ -55,6 +55,26 @@ LLM_RETRY_BACKOFF_S = 1.5
 
 HS_CODE_RE = re.compile(r"\b(\d{6})\b")
 
+# Matches a company-shaped phrase in the rationale: capitalized run of 1-5
+# tokens optionally followed by a corporate suffix. Used to catch
+# hallucinated lead-name substitutions (e.g. Pearhead → "Pearson Inc").
+_CORP_SUFFIX = r"Inc\.?|Incorporated|LLC|L\.L\.C\.|Ltd\.?|Limited|Corp\.?|Corporation|Co\.?|Company|Group|Holdings?|GmbH|S\.?A\.?|PLC|LLP|Pty"
+COMPANY_SHAPED_RE = re.compile(
+    r"\b((?:[A-Z][\w&'\-]*)(?:\s+(?:[A-Z][\w&'\-]*|of|and|&)){0,4})"
+    rf"(?:\s+(?:{_CORP_SUFFIX}))\b"
+)
+_COMPANY_NORM_STRIP_RE = re.compile(
+    rf"\b(?:{_CORP_SUFFIX})\.?\b|[^\w\s]",
+    re.IGNORECASE,
+)
+_WS_RE = re.compile(r"\s+")
+
+
+def _normalize_company(name: str) -> str:
+    """Strip corporate suffixes + punctuation, lowercase, collapse whitespace."""
+    s = _COMPANY_NORM_STRIP_RE.sub(" ", name).lower()
+    return _WS_RE.sub(" ", s).strip()
+
 # Cached system prompt — everything that doesn't change per lead lives here.
 # Tagged with cache_control=ephemeral so the 50-lead batch only pays full
 # input-token price once.
@@ -67,6 +87,10 @@ Constraints (strictly enforced by downstream factuality check; violations are re
 - Do NOT mention or invent any HS code, port, competitor name, person, or company not present in the payload.
 - Do NOT mention the lead's score itself.
 - Be terse and analytical. Plain factual English. No marketing language, no exclamation marks, no hedging adverbs.
+
+Status semantics — read carefully:
+- `synced_to_crm` is the NORMAL/default state in this dataset; every active importer is already in the operator's CRM. It is NOT a negative signal. Do not criticize it, do not call it "already in CRM", do not say "deprioritize for that reason", do not mention it at all unless directly relevant. Treat absence of `synced_to_crm` as neutral.
+- `not_interested` means the operator has previously contacted this lead and they declined. They are still worth pursuing on a strong new signal — frame the rationale as a re-engagement angle citing what changed (volume, recency, new contact, HS shift). Do not treat as disqualifying.
 
 The payload includes a "Top signal" field — let it guide where you anchor the rationale, but cite the literal data, not the label.
 
@@ -143,13 +167,13 @@ def _build_user_payload(f: LeadFeatures, components: dict[str, float]) -> str:
         ),
         f"Top signal (highest-weighted component): {driver} — {driver_label}",
     ]
-    if f.is_synced_to_crm:
-        parts.append("Already synced_to_crm — currently in the operator's pipeline.")
+    # NOTE: synced_to_crm is the default state in this dataset; don't surface
+    # it in the prompt at all (the system prompt already tells the model so).
     if f.is_not_interested:
         parts.append(
-            "Status=not_interested — operator previously declined this lead. "
-            "Frame the rationale as a re-engagement angle: cite a new or strong "
-            "signal that justifies revisiting, otherwise honestly note the prior decline."
+            "Status=not_interested — operator previously contacted this lead and they declined. "
+            "Frame the rationale as a re-engagement angle: cite the new or strong "
+            "signal that justifies a second attempt. Do not write the lead off."
         )
     return "\n".join(parts)
 
@@ -180,12 +204,17 @@ def _factuality_check(text: str, f: LeadFeatures) -> FactualityCheck:
 
     ok == True requires:
       1. every 6-digit number cited is in f.lead_hs_codes (no hallucinated HS)
-      2. at least one specific anchor cited. Anchors, in priority order:
+      2. every company-shaped phrase in the rationale resolves to the lead's
+         own company name (catches name substitution e.g. Pearhead → Pearson Inc).
+         Known anchors that LOOK like company-shaped phrases (competitor name,
+         contact name) are excluded from this check.
+      3. at least one specific anchor cited. Anchors, in priority order:
          a. HS code present in lead's hs_codes
          b. port name from lead's top_ports
          c. competitor name from lead's top_competitor_name
          d. senior contact title
-         e. numeric BOL metric from the lead's own data (incl. honest zeros) —
+         e. correct mention of the lead's own company name
+         f. numeric BOL metric from the lead's own data (incl. honest zeros) —
             covers the "no-signal" case where the lead has no positive anchor
             available; without this rule a truthful "0 matching shipments, no
             HS overlap" rationale would be wrongly rejected
@@ -207,24 +236,61 @@ def _factuality_check(text: str, f: LeadFeatures) -> FactualityCheck:
     if f.senior_contact_title and f.senior_contact_title.lower() in lower:
         cited_titles.append(f.senior_contact_title)
 
+    # Company-name validation: find every Inc/LLC/Co/Ltd-suffixed phrase, normalize
+    # both that and the lead's company name, compare. Known non-lead entities
+    # (resolved competitor name) are whitelisted so they don't count as invalid.
+    lead_norm = _normalize_company(f.company) if f.company else ""
+    whitelist = {lead_norm}
+    if f.top_competitor_name:
+        whitelist.add(_normalize_company(f.top_competitor_name))
+    if f.senior_contact_name:
+        whitelist.add(_normalize_company(f.senior_contact_name))
+
+    cited_companies: list[str] = []
+    invalid_companies: list[str] = []
+    for match in COMPANY_SHAPED_RE.findall(text):
+        norm = _normalize_company(match)
+        if not norm:
+            continue
+        if norm in whitelist:
+            if norm == lead_norm and norm:
+                cited_companies.append(match.strip())
+        else:
+            invalid_companies.append(match.strip())
+
+    # Also catch lead-name mentions WITHOUT a corporate suffix (rare but valid
+    # anchor). Substring match on the normalized lead name in the lowered text.
+    if lead_norm and lead_norm in lower and not cited_companies:
+        cited_companies.append(f.company)
+
+    company_ok = not invalid_companies
+
     has_bol_anchor = _has_numeric_bol_anchor(text, f)
     has_anchor = bool(
-        cited_hs or cited_ports or cited_competitors or cited_titles or has_bol_anchor
+        cited_hs or cited_ports or cited_competitors or cited_titles
+        or cited_companies or has_bol_anchor
     )
 
     reason: str | None = None
     if not hs_ok:
         reason = f"cited HS code(s) {invalid_hs} not in lead's hs_codes"
+    elif not company_ok:
+        reason = (
+            f"company-shaped phrase {invalid_companies} does not match lead "
+            f"{f.company!r}"
+        )
     elif not has_anchor:
-        reason = "no specific anchor cited (no HS code, port, competitor, title, or BOL metric)"
+        reason = "no specific anchor cited (no HS code, port, competitor, title, company, or BOL metric)"
 
     return FactualityCheck(
-        ok=hs_ok and has_anchor,
+        ok=hs_ok and company_ok and has_anchor,
         cited_hs_codes=cited_hs,
         cited_ports=cited_ports,
         cited_competitors=cited_competitors,
         cited_titles=cited_titles,
+        cited_companies=cited_companies,
         invalid_hs_codes=invalid_hs,
+        invalid_companies=invalid_companies,
         has_anchor=has_anchor,
         reason=reason,
     )
@@ -233,11 +299,11 @@ def _factuality_check(text: str, f: LeadFeatures) -> FactualityCheck:
 # ---------- deterministic fallback ----------
 
 def fallback_text(f: LeadFeatures, components: dict[str, float]) -> str:
-    if f.is_not_interested:
-        return "Marked not_interested by operator; would normally be filtered before this layer."
-
     driver = top_driver(components)
     parts: list[str] = []
+
+    if f.is_not_interested:
+        parts.append("Previously declined; re-engagement candidate on new signal")
 
     if f.hs_overlap:
         parts.append(
@@ -276,8 +342,7 @@ def fallback_text(f: LeadFeatures, components: dict[str, float]) -> str:
     elif f.contact_count == 0:
         parts.append("no contact in dataset")
 
-    if f.is_synced_to_crm:
-        parts.append("already in CRM — deprioritize")
+    # synced_to_crm = default state on this dataset; not mentioned in fallback.
 
     if not parts:
         # Use driver as last resort

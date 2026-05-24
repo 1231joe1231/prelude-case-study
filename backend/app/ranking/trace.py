@@ -55,7 +55,9 @@ class FactualityCheck:
     cited_ports: list[str] = field(default_factory=list)
     cited_competitors: list[str] = field(default_factory=list)
     cited_titles: list[str] = field(default_factory=list)
+    cited_companies: list[str] = field(default_factory=list)   # correct lead-name mentions
     invalid_hs_codes: list[str] = field(default_factory=list)
+    invalid_companies: list[str] = field(default_factory=list) # hallucinated company-shaped phrases
     has_anchor: bool = False
     reason: str | None = None  # human-readable why-rejected
 

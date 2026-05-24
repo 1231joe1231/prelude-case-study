@@ -109,7 +109,7 @@ For each lead, compute features that combine the three CSVs:
 | bol_competitors.csv `LOW/MED/HIGH` bucket on overlapping competitors | concentration risk | dominated by one big competitor = uphill |
 | personnel.csv contact count + email presence | reachability | a lead with no email is not actionable |
 | personnel.csv title (if present) | seniority | decision-maker > generic ops contact |
-| leads.csv `status` | filter | drop `not_interested`; treat `synced_to_crm` as "already in play" |
+| leads.csv `status` | re-engagement signal | `synced_to_crm` = default (no penalty); `not_interested` = soft 0.4× penalty (declined, not dead — re-engage on strong new signal) |
 
 Compose into a single score (weights initially hand-set, later learnable from `status` feedback).
 
