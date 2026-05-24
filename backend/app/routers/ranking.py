@@ -1,15 +1,15 @@
-"""Ranking endpoint: deterministic pipeline + LLM rationale (background-upgraded).
+"""Ranking endpoint: read-only.
 
-The endpoint returns immediately with a fallback rationale per lead and kicks
-off an async LLM batch for any leads not yet cached. The frontend polls the
-same endpoint every ~2s; each call merges the latest cache state.
-`rationale_source` per row drives the UI indicator:
+Computes scoring on the fly (it's deterministic + cheap) but does NOT kick the
+LLM batch. The full pipeline (including rationale generation) is triggered
+explicitly via POST /api/pipeline/run from the frontend Pipeline page.
 
-  pending  → fallback shown + spinner
-  llm      → LLM rationale, factuality-verified
-  fallback → deterministic synth (no key, LLM error, or factuality failure)
+Rationale text comes from whatever's in the cache:
+  - cached llm/fallback  → real generated text
+  - no cache entry yet   → reasoning="" and rationale_source="not_generated"
 
-When `stats.pending` reaches 0, the frontend stops polling.
+Frontend should show a "Run pipeline first" message when most rows report
+'not_generated'.
 """
 from __future__ import annotations
 
@@ -17,17 +17,17 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from ..db import get_db
-from ..ranking.cache import get_or_kick, stats as cache_stats
+from ..ranking.cache import get_cached, stats as cache_stats
 from ..ranking.features import extract_all
 from ..ranking.persona import get_persona
 from ..ranking.score import WEIGHTS, score_lead
-from ..ranking.trace import emit, events_since, get_trace, trace_count
+from ..ranking.trace import events_since, get_trace, trace_count
 
 router = APIRouter(prefix="/leads", tags=["ranking"])
 
 
 @router.get("/ranked")
-async def get_ranked(
+def get_ranked(
     limit: int = Query(50, ge=1, le=500),
     db: Session = Depends(get_db),
 ) -> dict:
@@ -40,45 +40,39 @@ async def get_ranked(
     scored.sort(key=lambda x: x[1], reverse=True)
     top = scored[:limit]
 
-    n_not_interested = sum(1 for f in all_features if f.is_not_interested)
-    emit(
-        "ranking_request",
-        f"/ranked limit={limit} → returning top {len(top)} of {len(scored)} scored",
-        limit=limit,
-        returned=len(top),
-        scored=len(scored),
-        not_interested_in_pool=n_not_interested,
-    )
-
-    # Seed cache + kick off background LLM batch for any uncached leads
-    cache_snapshot = await get_or_kick([(f, c) for f, _, c in top])
-
     rows = []
-    row_stats = {"pending": 0, "llm": 0, "fallback": 0}
+    row_stats = {"not_generated": 0, "pending": 0, "llm": 0, "fallback": 0}
     for f, composite, components in top:
-        cached = cache_snapshot.get(f.lead_id)
-        src = cached.source if cached else "fallback"
+        cached = get_cached(f.lead_id)
+        if cached is None:
+            src = "not_generated"
+            text = ""
+            fact_ok = False
+        else:
+            src = cached.source
+            text = cached.text
+            fact_ok = cached.factuality_ok
         rows.append({
             "lead_id": f.lead_id,
             "company": f.company,
             "score": round(composite, 4),
             "components": {k: round(v, 4) for k, v in components.items()},
             "features": f.to_dict(),
-            "reasoning": cached.text if cached else "",
+            "reasoning": text,
             "rationale_source": src,
-            "factuality_ok": cached.factuality_ok if cached else False,
+            "factuality_ok": fact_ok,
             "selected": False,
         })
         row_stats[src] = row_stats.get(src, 0) + 1
 
     return {
         "rows": rows,
-        # Stats are computed over the RANKED ROWS, not the whole cache, so the
-        # totals line up with what the table shows. Whole-cache stats live on
-        # /api/ranking/events for ops debugging.
+        # Stats computed over RANKED ROWS, not whole cache, so totals match
+        # the displayed table. Whole-cache stats live on /api/ranking/events.
         "stats": row_stats,
         "cache_stats": cache_stats(),
         "pending_count": row_stats["pending"],
+        "not_generated_count": row_stats["not_generated"],
     }
 
 

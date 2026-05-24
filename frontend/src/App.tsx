@@ -13,7 +13,7 @@ import '@xyflow/react/dist/style.css'
 import { api } from './lib/api'
 
 type Row = Record<string, unknown>
-type Page = 'deliverable' | 'tables' | 'graph' | 'trace'
+type Page = 'pipeline' | 'deliverable' | 'tables' | 'graph' | 'trace'
 type TableKey =
   | 'leads'
   | 'personnel'
@@ -65,7 +65,7 @@ const TABLE_CONFIG: Record<TableKey, { label: string; cols: string[]; endpoint: 
   shipments:             { label: 'shipments',             cols: SHIPMENT_COLS,  endpoint: '/tables/shipments' },
 }
 
-type RationaleSource = 'pending' | 'llm' | 'fallback'
+type RationaleSource = 'pending' | 'llm' | 'fallback' | 'not_generated'
 
 type RankedLead = {
   lead_id: string
@@ -82,7 +82,9 @@ type RankedLead = {
 type RankedResponse = {
   rows: RankedLead[]
   stats: Record<string, number>
+  cache_stats: Record<string, number>
   pending_count: number
+  not_generated_count: number
 }
 
 type LLMCallTrace = {
@@ -132,6 +134,31 @@ type EventsResponse = {
   trace_count: number
   cache_stats: Record<string, number>
   weights: Record<string, number>
+}
+
+type PipelineStage =
+  | 'idle'
+  | 'ingesting'
+  | 'ingested'
+  | 'persona_inferring'
+  | 'feature_extracting'
+  | 'scoring'
+  | 'llm_batching'
+  | 'complete'
+  | 'error'
+
+type PipelineStatus = {
+  stage: PipelineStage
+  input_version: string
+  ingest_counts: Record<string, number>
+  persona_hs_codes: string[]
+  scored_count: number
+  llm_total: number
+  llm_done: number
+  llm_failed: number
+  last_started_at: number | null
+  last_finished_at: number | null
+  error: string | null
 }
 
 function renderCell(v: unknown): { display: string; title: string; muted: boolean } {
@@ -193,6 +220,13 @@ function ComponentBar({ name, value }: { name: string; value: number }) {
 }
 
 function RationaleCell({ row }: { row: RankedLead }) {
+  if (row.rationale_source === 'not_generated') {
+    return (
+      <span className="text-[11px] italic text-slate-400">
+        — not generated (run pipeline) —
+      </span>
+    )
+  }
   if (row.rationale_source === 'pending') {
     return (
       <div className="flex items-start gap-2">
@@ -442,9 +476,11 @@ function DeliverablePage() {
         .then((r) => {
           if (stopped) return
           setResp(r)
-          if (r.pending_count > 0) {
-            timer = setTimeout(fetchOnce, POLL_INTERVAL_MS)
-          }
+          // Fast 2s poll while a batch is in flight (pending > 0).
+          // Slow 5s poll otherwise so we catch pipeline runs triggered from
+          // the Pipeline tab without burning requests if operator just sits here.
+          const delay = r.pending_count > 0 ? POLL_INTERVAL_MS : 5000
+          timer = setTimeout(fetchOnce, delay)
         })
         .catch((e) => {
           if (stopped) return
@@ -488,21 +524,26 @@ function DeliverablePage() {
 
   const rows = resp?.rows ?? null
   const pending = resp?.pending_count ?? 0
+  const notGenerated = resp?.not_generated_count ?? 0
   const llmDone = resp ? (resp.stats.llm ?? 0) : 0
   const fallbackDone = resp ? (resp.stats.fallback ?? 0) : 0
+  const noneGenerated = resp && notGenerated === rows?.length
 
   return (
     <div className="flex h-full flex-col gap-4">
       <div className="shrink-0">
         <h2 className="text-lg font-medium tracking-tight">Ranked outreach targets</h2>
         <p className="text-sm text-slate-600">
-          Top US importers worth chasing for the factory. Score combines volume, recency, HS-code fit, competitor pressure, reachability, and seniority.
+          Top US importers worth chasing for the factory. Score combines volume, HS-code fit, competitor pressure, reachability, and seniority.
         </p>
         {resp && (
           <div className="mt-1.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-500">
             <span>{rows?.length ?? 0} ranked</span>
             <span className="text-emerald-700">{llmDone} LLM</span>
             <span className="text-slate-500">{fallbackDone} fallback</span>
+            {notGenerated > 0 && (
+              <span className="text-amber-700">{notGenerated} not yet generated</span>
+            )}
             {pending > 0 && (
               <span className="flex items-center gap-1.5 text-slate-700">
                 <span className="inline-block h-2.5 w-2.5 animate-spin rounded-full border-2 border-slate-300 border-t-slate-700" />
@@ -512,6 +553,12 @@ function DeliverablePage() {
           </div>
         )}
       </div>
+
+      {noneGenerated && (
+        <div className="shrink-0 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+          Rationales not generated yet. Switch to the <span className="font-medium">Pipeline</span> tab and click <span className="font-medium">Run pipeline</span>.
+        </div>
+      )}
 
       {error && <p className="shrink-0 text-red-600">error: {error}</p>}
       {!error && !rows && <p className="shrink-0 text-slate-500">loading…</p>}
@@ -1126,7 +1173,294 @@ function TracePage() {
   )
 }
 
+const STAGE_ORDER: PipelineStage[] = [
+  'ingesting', 'ingested', 'persona_inferring',
+  'feature_extracting', 'scoring', 'llm_batching', 'complete',
+]
+
+const STAGE_LABEL: Record<PipelineStage, string> = {
+  idle: 'Idle',
+  ingesting: 'Ingesting CSVs',
+  ingested: 'Ingested (ready)',
+  persona_inferring: 'Inferring persona',
+  feature_extracting: 'Extracting features',
+  scoring: 'Scoring',
+  llm_batching: 'LLM rationales',
+  complete: 'Complete',
+  error: 'Error',
+}
+
+function StageStep({
+  stage, currentStage, isError, llmDone, llmTotal,
+}: {
+  stage: PipelineStage; currentStage: PipelineStage; isError: boolean
+  llmDone: number; llmTotal: number
+}) {
+  const currentIdx = STAGE_ORDER.indexOf(currentStage)
+  const myIdx = STAGE_ORDER.indexOf(stage)
+  let state: 'done' | 'active' | 'pending'
+  if (isError) state = myIdx < currentIdx ? 'done' : myIdx === currentIdx ? 'active' : 'pending'
+  else if (myIdx < currentIdx) state = 'done'
+  else if (myIdx === currentIdx) state = 'active'
+  else state = 'pending'
+
+  const cls = {
+    done:    'bg-emerald-100 text-emerald-800 ring-emerald-200',
+    active:  'bg-slate-900 text-white ring-slate-900',
+    pending: 'bg-slate-100 text-slate-400 ring-slate-200',
+  }[state]
+
+  const showProgress = stage === 'llm_batching' && state === 'active' && llmTotal > 0
+  return (
+    <div className={`flex flex-col gap-1 rounded-md px-3 py-2 ring-1 ${cls}`}>
+      <div className="text-[10px] uppercase tracking-wider opacity-80">
+        {STAGE_ORDER.indexOf(stage) + 1}. {STAGE_LABEL[stage]}
+      </div>
+      {showProgress && (
+        <div className="font-mono text-xs">
+          {llmDone}/{llmTotal}
+          <div className="mt-0.5 h-1 w-24 overflow-hidden rounded-full bg-white/30">
+            <div className="h-full bg-white" style={{ width: `${(llmDone / llmTotal) * 100}%` }} />
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+const BUSY_STAGES: PipelineStage[] = [
+  'ingesting', 'persona_inferring', 'feature_extracting', 'scoring', 'llm_batching',
+]
+
+function PipelinePage() {
+  const [status, setStatus] = useState<PipelineStatus | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [limit, setLimit] = useState(50)
+  const [acting, setActing] = useState(false)
+
+  const isBusy = status ? BUSY_STAGES.includes(status.stage) : false
+  const pollMs = isBusy ? 1000 : 4000
+
+  useEffect(() => {
+    let stopped = false
+    let timer: ReturnType<typeof setTimeout> | null = null
+    const tick = () => {
+      api.get<PipelineStatus>('/pipeline/status')
+        .then((s) => {
+          if (stopped) return
+          setStatus(s)
+          timer = setTimeout(tick, BUSY_STAGES.includes(s.stage) ? 1000 : 4000)
+        })
+        .catch((e) => {
+          if (stopped) return
+          setError(String(e))
+          timer = setTimeout(tick, 4000)
+        })
+    }
+    tick()
+    return () => { stopped = true; if (timer) clearTimeout(timer) }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pollMs])
+
+  const switchInput = async (version: 'real' | 'golden') => {
+    setActing(true)
+    setError(null)
+    try {
+      await api.post('/pipeline/switch_input', { version })
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setActing(false)
+    }
+  }
+
+  const runPipeline = async () => {
+    setActing(true)
+    setError(null)
+    try {
+      await api.post('/pipeline/run', { limit })
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setActing(false)
+    }
+  }
+
+  const resetCache = async () => {
+    setActing(true)
+    setError(null)
+    try {
+      await api.post('/pipeline/reset_cache')
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setActing(false)
+    }
+  }
+
+  if (!status) {
+    return (
+      <div className="flex h-full items-center justify-center text-slate-500">
+        {error ? <span className="text-red-600">error: {error}</span> : 'loading…'}
+      </div>
+    )
+  }
+
+  const canRun = status.stage === 'ingested' || status.stage === 'complete' || status.stage === 'error'
+  const canSwitch = !isBusy
+
+  return (
+    <div className="flex h-full flex-col gap-4 overflow-auto">
+      <div className="shrink-0">
+        <h2 className="text-lg font-medium tracking-tight">Pipeline control</h2>
+        <p className="text-sm text-slate-600">
+          Switch input dataset and trigger the ranking pipeline (persona → features → score → LLM rationale).
+          Backend startup only ingests CSVs; nothing else runs until you click <span className="font-medium">Run pipeline</span>.
+        </p>
+      </div>
+
+      {error && (
+        <div className="shrink-0 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+          {error}
+        </div>
+      )}
+
+      {/* Input switcher */}
+      <section className="shrink-0 rounded-lg border border-slate-200 bg-white p-4">
+        <h3 className="mb-2 text-xs font-semibold uppercase tracking-wider text-slate-700">Input dataset</h3>
+        <div className="flex flex-wrap items-center gap-3">
+          {(['real', 'golden'] as const).map((v) => {
+            const active = status.input_version === v
+            return (
+              <button
+                key={v}
+                disabled={!canSwitch || acting}
+                onClick={() => switchInput(v)}
+                className={
+                  'rounded-md px-3 py-1.5 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40 ' +
+                  (active
+                    ? 'bg-slate-900 text-white'
+                    : 'bg-slate-100 text-slate-700 hover:bg-slate-200')
+                }
+              >
+                {v === 'real' ? 'Real (121 leads)' : 'Golden (10 leads — synthetic)'}
+                {active && <span className="ml-1.5 text-[10px] opacity-70">active</span>}
+              </button>
+            )
+          })}
+          <span className="ml-auto text-xs text-slate-500">
+            switching re-ingests + clears rationale cache
+          </span>
+        </div>
+
+        {Object.keys(status.ingest_counts).length > 0 && (
+          <div className="mt-3 grid grid-cols-3 gap-2 text-xs sm:grid-cols-6">
+            {(['leads', 'personnel', 'competitors', 'lead_attributes', 'competitor_attributes', 'shipments'] as const).map((k) => (
+              <div key={k} className="rounded bg-slate-50 px-2 py-1">
+                <div className="text-[10px] uppercase tracking-wider text-slate-500">{k}</div>
+                <div className="font-mono text-slate-900">{status.ingest_counts[k] ?? 0}</div>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+
+      {/* Run controls */}
+      <section className="shrink-0 rounded-lg border border-slate-200 bg-white p-4">
+        <h3 className="mb-2 text-xs font-semibold uppercase tracking-wider text-slate-700">Run pipeline</h3>
+        <div className="flex flex-wrap items-center gap-3">
+          <label className="flex items-center gap-2 text-sm text-slate-700">
+            top-N:
+            <input
+              type="number" min={1} max={500}
+              value={limit}
+              onChange={(e) => setLimit(Math.max(1, Math.min(500, parseInt(e.target.value || '0', 10))))}
+              className="w-20 rounded-md border border-slate-300 px-2 py-1 text-sm"
+            />
+          </label>
+          <button
+            disabled={!canRun || acting}
+            onClick={runPipeline}
+            className="rounded-md bg-emerald-600 px-4 py-1.5 text-sm font-medium text-white transition-colors hover:bg-emerald-700 disabled:cursor-not-allowed disabled:bg-slate-300"
+          >
+            {isBusy ? 'Running…' : 'Run pipeline'}
+          </button>
+          <button
+            disabled={isBusy || acting}
+            onClick={resetCache}
+            className="rounded-md border border-slate-300 px-3 py-1.5 text-sm text-slate-700 transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            Reset cache
+          </button>
+        </div>
+      </section>
+
+      {/* Stage indicator */}
+      <section className="shrink-0 rounded-lg border border-slate-200 bg-white p-4">
+        <h3 className="mb-3 text-xs font-semibold uppercase tracking-wider text-slate-700">
+          Stage: <span className="text-slate-900 normal-case">{STAGE_LABEL[status.stage]}</span>
+          {status.error && <span className="ml-2 rounded bg-red-100 px-2 py-0.5 text-[10px] font-medium text-red-700">{status.error}</span>}
+        </h3>
+        <div className="flex flex-wrap gap-2">
+          {STAGE_ORDER.map((s) => (
+            <StageStep
+              key={s}
+              stage={s}
+              currentStage={status.stage}
+              isError={status.stage === 'error'}
+              llmDone={status.llm_done}
+              llmTotal={status.llm_total}
+            />
+          ))}
+        </div>
+        {status.last_started_at && (
+          <div className="mt-3 text-xs text-slate-500">
+            started {fmtTs(status.last_started_at)}
+            {status.last_finished_at && (
+              <> · finished {fmtTs(status.last_finished_at)} · {Math.max(0, Math.round(status.last_finished_at - status.last_started_at))}s</>
+            )}
+          </div>
+        )}
+      </section>
+
+      {/* Summary */}
+      <section className="shrink-0 rounded-lg border border-slate-200 bg-white p-4">
+        <h3 className="mb-2 text-xs font-semibold uppercase tracking-wider text-slate-700">Summary</h3>
+        <div className="grid grid-cols-2 gap-3 text-sm sm:grid-cols-4">
+          <div>
+            <div className="text-[10px] uppercase tracking-wider text-slate-500">input</div>
+            <div className="font-mono text-slate-900">{status.input_version}</div>
+          </div>
+          <div>
+            <div className="text-[10px] uppercase tracking-wider text-slate-500">scored</div>
+            <div className="font-mono text-slate-900">{status.scored_count}</div>
+          </div>
+          <div>
+            <div className="text-[10px] uppercase tracking-wider text-slate-500">llm done</div>
+            <div className="font-mono text-slate-900">{status.llm_done}/{status.llm_total}</div>
+          </div>
+          <div>
+            <div className="text-[10px] uppercase tracking-wider text-slate-500">fallbacks</div>
+            <div className="font-mono text-slate-900">{status.llm_failed}</div>
+          </div>
+        </div>
+        {status.persona_hs_codes.length > 0 && (
+          <div className="mt-3">
+            <div className="text-[10px] uppercase tracking-wider text-slate-500">persona HS codes</div>
+            <div className="mt-1 flex flex-wrap gap-1">
+              {status.persona_hs_codes.map((c) => (
+                <span key={c} className="rounded bg-slate-100 px-2 py-0.5 font-mono text-[11px] text-slate-700">{c}</span>
+              ))}
+            </div>
+          </div>
+        )}
+      </section>
+    </div>
+  )
+}
+
 const PAGE_LABEL: Record<Page, string> = {
+  pipeline: 'Pipeline',
   deliverable: 'Deliverable',
   tables: 'Tables',
   graph: 'Graph',
@@ -1134,7 +1468,7 @@ const PAGE_LABEL: Record<Page, string> = {
 }
 
 function App() {
-  const [page, setPage] = useState<Page>('deliverable')
+  const [page, setPage] = useState<Page>('pipeline')
 
   return (
     <div className="flex h-screen flex-col bg-slate-50 text-slate-900">
@@ -1142,7 +1476,7 @@ function App() {
         <div className="mx-auto flex max-w-350 items-center justify-between px-6 py-3">
           <h1 className="text-base font-semibold tracking-tight">Prelude Case Study</h1>
           <nav className="flex gap-1">
-            {(['deliverable', 'tables', 'graph', 'trace'] as Page[]).map((p) => (
+            {(['pipeline', 'deliverable', 'tables', 'graph', 'trace'] as Page[]).map((p) => (
               <button
                 key={p}
                 onClick={() => setPage(p)}
@@ -1162,6 +1496,7 @@ function App() {
 
       <main className="min-h-0 flex-1 overflow-hidden">
         <div className="mx-auto h-full max-w-350 px-6 py-6">
+          {page === 'pipeline' && <PipelinePage />}
           {page === 'deliverable' && <DeliverablePage />}
           {page === 'tables' && <TablesPage />}
           {page === 'graph' && <GraphPage />}

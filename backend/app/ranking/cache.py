@@ -22,6 +22,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Literal
 
+from ..pipeline import state as pstate
 from .features import LeadFeatures
 from .rationale import (
     CONCURRENCY,
@@ -144,6 +145,7 @@ async def _run_batch(items: list[tuple[LeadFeatures, dict[str, float]]]) -> None
             r, t = make_fallback(f, c, "fallback_no_key")
             await _persist_result(f, r, t)
             by_source[t.final_source] = by_source.get(t.final_source, 0) + 1
+            pstate.tick_llm(t.final_source)
         emit(
             "batch_complete",
             f"LLM batch complete (no-key fallback): {by_source}",
@@ -151,6 +153,7 @@ async def _run_batch(items: list[tuple[LeadFeatures, dict[str, float]]]) -> None
             by_source=by_source,
             duration_ms=int((time.time() - started) * 1000),
         )
+        pstate.finish(finished_at=time.time())
         return
 
     sem = asyncio.Semaphore(CONCURRENCY)
@@ -173,6 +176,7 @@ async def _run_batch(items: list[tuple[LeadFeatures, dict[str, float]]]) -> None
         try:
             src = await coro
             by_source[src] = by_source.get(src, 0) + 1
+            pstate.tick_llm(src)
         except Exception:
             log.exception("rationale.cache: task wrapper exception")
 
@@ -183,6 +187,7 @@ async def _run_batch(items: list[tuple[LeadFeatures, dict[str, float]]]) -> None
         by_source=by_source,
         duration_ms=int((time.time() - started) * 1000),
     )
+    pstate.finish(finished_at=time.time())
     log.info("rationale.cache: batch complete for %d leads (%s)", len(items), by_source)
 
 

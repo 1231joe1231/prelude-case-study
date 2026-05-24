@@ -43,6 +43,9 @@ def infer_persona(db: Session, top_n: int = DEFAULT_TOP_N) -> Persona:
         counts={code: cnt for code, cnt in top_with_counts},
         total_distinct=len(counts),
     )
+    # Surface to the pipeline state so the frontend Pipeline page shows it
+    from ..pipeline import state as pstate
+    pstate.set_persona(top)
     return Persona(
         hs_codes=frozenset(top),
         hs_code_ranks={code: i for i, code in enumerate(top)},
