@@ -6,3 +6,4 @@ python-multipart==0.0.20
 pandas==2.2.3
 anthropic>=0.40.0
 python-dotenv>=1.0.0
+pytest>=8.0.0

@@ -65,6 +65,13 @@ CONTACT_SATURATION = 3
 
 NOT_INTERESTED_PENALTY = 0.4   # Slight, not a drop. See module docstring.
 
+# Hard product-fit floor: if the lead's HS codes do not overlap the factory's
+# persona at all, no amount of volume / reachability / seniority justifies a
+# top rank — we have no product to pitch them. Multiplicative penalty rather
+# than a drop, so the lead is still ranked (operator can audit), but pushed
+# far enough down that wrong-product leads don't crash the top of the list.
+HS_MISMATCH_PENALTY = 0.5
+
 
 def _clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, x))
@@ -109,6 +116,10 @@ def score_lead(f: LeadFeatures) -> tuple[float, dict[str, float]]:
     """
     components = _component_scores(f)
     composite = sum(WEIGHTS[k] * v for k, v in components.items())
+    # Hard penalty for zero HS overlap — wrong-product leads can't beat
+    # weakly-aligned in-product leads no matter how active they are.
+    if f.hs_overlap_count == 0 and f.lead_hs_codes:
+        composite *= HS_MISMATCH_PENALTY
     if f.is_not_interested:
         composite *= NOT_INTERESTED_PENALTY
     return _clamp(composite), components

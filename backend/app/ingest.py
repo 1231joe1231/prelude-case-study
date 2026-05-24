@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -34,7 +35,22 @@ from .models import (
 
 log = logging.getLogger("uvicorn.error")
 
-INPUT_DIR = Path(__file__).resolve().parent.parent / "input"
+# INPUT_VERSION picks which subdir under backend/input/ to ingest from. Default
+# 'real' is the 121/120/30 dataset from the brief. Set to 'golden' (or any
+# other subdir name) in the test runner to assert exact expected rankings
+# against a hand-crafted small set. CSV column layout must match across
+# versions — no headers, same column order — so this code stays version-agnostic.
+INPUT_BASE = Path(__file__).resolve().parent.parent / "input"
+
+
+def get_input_dir() -> Path:
+    """Return the active input directory based on $INPUT_VERSION.
+
+    Read at call time (not at import) so test runners can set the env var
+    inside a fixture without re-importing the module.
+    """
+    version = os.environ.get("INPUT_VERSION", "real")
+    return INPUT_BASE / version
 
 LEADS_COLS = [
     "id", "company_name", "city_state", "data_source",
@@ -411,9 +427,11 @@ def _dedup_edges(
 # ---------- main ----------
 
 def ingest_all(session: Session) -> dict[str, int]:
-    leads_df = _read_csv(INPUT_DIR / "leads.csv", LEADS_COLS)
-    personnel_df = _read_csv(INPUT_DIR / "personnel.csv", PERSONNEL_COLS)
-    competitors_df = _read_csv(INPUT_DIR / "bol_competitors.csv", COMPETITORS_COLS)
+    input_dir = get_input_dir()
+    log.info("ingest: reading from %s", input_dir)
+    leads_df = _read_csv(input_dir / "leads.csv", LEADS_COLS)
+    personnel_df = _read_csv(input_dir / "personnel.csv", PERSONNEL_COLS)
+    competitors_df = _read_csv(input_dir / "bol_competitors.csv", COMPETITORS_COLS)
 
     lead_records = _records(leads_df)
     personnel_records = _records(personnel_df)

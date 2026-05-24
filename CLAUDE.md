@@ -8,21 +8,27 @@ A take-home for Prelude (cross-border B2B platform connecting Chinese factories 
 
 The agent is the deliverable. Frontend is intentionally minimal. Out of scope: drafting emails, filters/search/charts, auth, deployment, persistence beyond the demo.
 
-## Current state (scaffolding only, no agent yet)
+## Current state (pipeline + audit + eval harness done)
 
-What exists:
-- [backend/app/main.py](backend/app/main.py) — FastAPI app, CORS for `localhost:5173`, mounts `/api/health` and `/api/records`.
-- [backend/app/models.py](backend/app/models.py) — **placeholder `CustomsRecord` model that does NOT match the real CSV schema**. Will be replaced with `Lead`, `Personnel`, `Competitor` tables.
-- [backend/app/db.py](backend/app/db.py) — SQLAlchemy engine pointing at `backend/data.db` (SQLite).
-- [frontend/src/App.tsx](frontend/src/App.tsx) — boilerplate health-check page; will be replaced with the ranked table.
-- [frontend/vite.config.ts](frontend/vite.config.ts) — proxies `/api/*` → `http://localhost:8000`.
+Built:
+- `backend/app/main.py` — FastAPI app, CORS for `localhost:5173`, reads `backend/.env`, lifespan does drop+ingest+clear caches and emits startup events.
+- `backend/app/models.py` — `Lead`, `LeadAttribute`, `Personnel`, `Competitor`, `CompetitorAttribute`, `Shipment` (bipartite-graph edge table).
+- `backend/app/ingest.py` — reads CSVs from `backend/input/{INPUT_VERSION}/` (default `real`); flattens BOL payloads; normalizes HS/ports/products into `lead_attributes`; resolves shipment FKs via normalized name + alias map.
+- `backend/app/ranking/persona.py` — top-N HS codes aggregated from `competitor_attributes` (cached).
+- `backend/app/ranking/features.py` — `LeadFeatures` dataclass + pure per-lead extraction.
+- `backend/app/ranking/score.py` — weighted 6-component composite. Live WEIGHTS: `hs_fit=0.35, volume=0.30, reachability=0.25, seniority=0.10, recency=0, competitive=0`. Penalties: `not_interested → ×0.4`, `hs_overlap_count=0 → ×0.5`. See module docstring for tuning rationale.
+- `backend/app/ranking/rationale.py` — Anthropic SDK single-call per lead, ephemeral prompt cache, factuality check (HS / ports / competitors / titles / numeric BOL anchors), deterministic fallback on missing key / 429 / factuality fail. Retry on transient errors. `CONCURRENCY=4` (free-tier 50 req/min).
+- `backend/app/ranking/cache.py` — in-memory cache; streams per-lead writes to cache + trace as each LLM call completes (not gather-then-flush).
+- `backend/app/ranking/trace.py` — `RationaleTrace` (full 6-stage audit) + global event ring buffer.
+- `backend/app/routers/ranking.py` — `GET /api/leads/ranked`, `/persona`, `/{id}/trace`, `/ranking/events`.
+- `backend/app/routers/tables.py` — `GET /api/tables/{leads|personnel|competitors|lead_attributes|competitor_attributes|shipments}`.
+- `backend/scripts/build_golden.py` — synthesizes the 10-lead/8-personnel/5-competitor golden set; each lead is a hand-designed scenario.
+- `backend/tests/test_golden_ranking.py` — 12 pytest assertions over the golden set (rank-1 sanity, penalty correctness, hs_fit dominance, ablation).
+- `frontend/src/App.tsx` — 4-tab SPA: Deliverable (ranked table + per-lead 6-stage trace expander), Tables (dropdown over 6 tables), Graph (ReactFlow bipartite), Trace (global event stream).
 
-What is missing (everything that matters):
-- CSV ingestion / schema for all three entities
-- The agent itself
-- Ranking + reasoning API endpoint
-- The single-page table UI with the "selected for outreach" checkbox
-- The README required by the brief (architecture defence, scaling story, eval plan)
+Remaining (CLAUDE.md plan):
+- `POST /api/leads/{id}/select` — operator selection persistence (separate from CSV `status`).
+- Final README the brief asks for (architecture defence, scaling story, eval plan, working assumptions).
 
 ## Commands
 
@@ -46,7 +52,19 @@ npm run build    # tsc -b && vite build
 npm run lint     # eslint
 ```
 
-No test runner is configured yet. If tests are added, prefer `pytest` for backend (deterministic feature-extraction tests are the highest-value targets) and `vitest` for frontend.
+### Tests
+```powershell
+cd backend
+.\.venv\Scripts\Activate.ps1
+pytest tests -v
+```
+- `tests/conftest.py` sets `INPUT_VERSION=golden` in-process and rebuilds a per-session test DB.
+- `tests/test_golden_ranking.py` asserts ranking on the hand-designed scenarios in `backend/scripts/build_golden.py`.
+
+To regenerate the golden CSVs after editing scenarios:
+```powershell
+.\.venv\Scripts\python.exe backend\scripts\build_golden.py
+```
 
 ## Source data (lives in `../` — parent of the project root)
 
@@ -124,8 +142,11 @@ Single page, single table. Columns: company, score, reasoning, checkbox. No filt
 ## Working assumptions to call out in the final README
 
 - The factory operator's product profile is inferred from the dominant HS codes in `bol_competitors.csv` (Christmas/decoration goods). In production this would be parameterized per factory.
-- "Worth chasing this week" = active recent shipping + product fit + reachable contact + not already in `not_interested`.
-- `synced_to_crm` is treated as "in play, deprioritize" not "won" — adjustable.
+- "Worth chasing this week" = product fit + reachable contact + activity volume + not in `not_interested` (or in `not_interested` with strong new signal — penalized × 0.4, not dropped).
+- `synced_to_crm` is treated as a neutral status on this dataset (every eligible lead is synced_to_crm; uniform penalty would be a no-op).
+- `not_interested` is penalized (× 0.4), not dropped — re-engagement is a real sales pattern when new signal arrives.
+- Zero HS-overlap leads are penalized × 0.5 — we have no product story to pitch them with regardless of activity.
+- Recency and competitive pressure features are computed and exposed, but weighted 0 in scoring until source data improves (16/121 leads have `most_recent_shipment`; only 5/50 top-ranked have any competitor edges).
 - Legacy `score` columns are ignored per brief.
 
 ## Conventions
@@ -135,29 +156,40 @@ Single page, single table. Columns: company, score, reasoning, checkbox. No filt
 - Vite dev proxy means frontend always calls `/api/...` (never absolute URLs).
 - SQLite file at `backend/data.db` is the demo store. Safe to delete and re-ingest.
 
-## Deferred design: input versioning + golden dataset
+## Input versioning + golden dataset (live)
 
-**Not built yet — capture intent for a future phase.**
+`ingest.py:get_input_dir()` reads `INPUT_VERSION` env (default `real`) and joins
+`backend/input/{version}/`. Tests set `INPUT_VERSION=golden` in `conftest.py`.
 
-Goal: be able to switch the backend between the **real** CSVs (current 121/120/30) and a **golden** dataset (hand-crafted small set with known-correct ranking). The golden set lets eval tests assert exact expected output. Switching back to real CSVs runs the actual demo.
-
-Planned shape:
+Layout:
 ```
 backend/input/
-  real/                  # current 121 leads, 120 personnel, 30 competitors
-    leads.csv
-    personnel.csv
-    bol_competitors.csv
-  golden/                # ~10 leads, ~10 personnel, ~5 competitors, hand-crafted
-    leads.csv
-    personnel.csv
-    bol_competitors.csv
+  real/      121 leads, 120 personnel, 30 competitors  (gitignored)
+  golden/    10  leads, 8   personnel, 5  competitors  (committed)
 ```
 
-- Env var `INPUT_VERSION=real|golden` (default `real`) selects which subdir `ingest.py` reads.
-- Eval pytest tests set `INPUT_VERSION=golden` and assert exact ranking output (e.g., "lead X must be #1").
-- Real run = default.
-- Golden CSVs must follow same column layout as real CSVs (no headers, same column order) so the same ingest code works without branching.
-- Build the golden set by hand from inspecting the real data: pick ~5 obvious "high score" leads (good HS overlap, recent volume, has senior contact, low competitor pressure) and ~5 obvious "low" (no email, no shipments, or `not_interested`).
+The golden CSVs are NOT picked from real data — they're synthesized by
+`backend/scripts/build_golden.py` so each lead exercises a specific code
+path. Scenarios:
 
-When implementing: refactor `INPUT_DIR` in `backend/app/ingest.py` to read `os.environ.get("INPUT_VERSION", "real")` and join. No other code changes needed since downstream tables are identical.
+| id        | scenario                | expected behavior                                       |
+|-----------|-------------------------|---------------------------------------------------------|
+| GOLD-001  | PERFECT_GREENFIELD      | rank #1 (full HS, high vol, recent, senior, no comps)   |
+| GOLD-002  | PERFECT_CONTESTED       | top-mid (5 competitor edges resolved via shipments)     |
+| GOLD-003  | DOMINANT_COMPETITOR     | top-mid (1 competitor at ~80% supplier share)           |
+| GOLD-004  | STALE_PERFECT           | top-mid (recency weight=0 → staleness doesn't hurt)     |
+| GOLD-005  | PARTIAL_MATCH           | middle (2/5 HS overlap)                                 |
+| GOLD-006  | NEW_GROWING             | mid-low (small volume even with senior contact)         |
+| GOLD-007  | HS_MISMATCH_HIGH_VOL    | low (HS_MISMATCH_PENALTY × 0.5 sinks the rank)          |
+| GOLD-008  | UNREACHABLE_PERFECT     | low (reachability + seniority both at floor)            |
+| GOLD-009  | NOT_INTERESTED_STRONG   | mid (× 0.4 penalty but still ranked)                    |
+| GOLD-010  | NOT_INTERESTED_WEAK     | dead last                                               |
+
+Eval suite (`backend/tests/test_golden_ranking.py`, 12 tests):
+- shape: ingest sanity, persona contains core Christmas codes
+- rank: GOLD-001 is #1, GOLD-010 is #10, top-4 are the strong synced leads
+- penalty: NOT_INTERESTED scaling, hs_mismatch beats high-volume nonsense
+- graph: contested lead resolves ≥3 edges, dominant edge yields ~80% share
+- ablation: zeroing hs_fit or volume changes top-5 (proves they're load-bearing)
+
+To regenerate after editing scenarios: `python backend/scripts/build_golden.py`.

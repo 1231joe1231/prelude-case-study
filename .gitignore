@@ -21,8 +21,10 @@ dist/
 *.sqlite
 *.sqlite3
 
-# Input data (not checked in)
-backend/input/
+# Input data
+# Only the 'real' subdir is gitignored — the hand-crafted 'golden' set is
+# committed because the eval harness depends on it.
+backend/input/real/
 
 # Dev-only artifacts: per-batch rationale dumps for weight/logic tuning.
 # Not part of project; gitignored so it doesn't clutter diffs.
