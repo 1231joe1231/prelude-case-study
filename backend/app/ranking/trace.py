@@ -68,9 +68,9 @@ class RationaleTrace:
     """
     lead_id: str
     generated_at: float
-    # Stage inputs
-    user_payload: str                       # exact text sent to the LLM
-    system_prompt_excerpt: str              # first ~200 chars of the cached system prompt
+    # Stage inputs — exact strings sent to the LLM (full, not truncated)
+    user_payload: str                       # per-lead user message
+    system_prompt: str                      # full cached system prompt
     # Stage 4: LLM call (None if API key absent → went straight to fallback)
     llm: LLMCallTrace | None = None
     # Stage 5: factuality (None if no LLM ran)

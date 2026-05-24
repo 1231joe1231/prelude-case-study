@@ -111,7 +111,7 @@ type RationaleTrace = {
   lead_id: string
   generated_at: number
   user_payload: string
-  system_prompt_excerpt: string
+  system_prompt: string
   llm: LLMCallTrace | null
   factuality: FactualityCheck | null
   final_source: string
@@ -337,10 +337,13 @@ function TraceExpander({ row, trace, error }: { row: RankedLead; trace: Rational
       {/* Stage 3: LLM prompt */}
       <div>
         <StageHeader n={3} title="LLM prompt (input to Claude)" />
-        <div className="space-y-2 rounded-md border border-slate-200 bg-white p-3">
-          <KV k="system_prompt (excerpt)" v={<span className="italic text-slate-600">{trace.system_prompt_excerpt}</span>} />
+        <div className="space-y-3 rounded-md border border-slate-200 bg-white p-3">
           <div>
-            <div className="text-[10px] uppercase tracking-wider text-slate-500">user_payload</div>
+            <div className="text-[10px] uppercase tracking-wider text-slate-500">system_prompt (cached, ephemeral)</div>
+            <pre className="mt-1 whitespace-pre-wrap rounded bg-slate-50 p-2 font-mono text-[10px] leading-relaxed text-slate-700">{trace.system_prompt}</pre>
+          </div>
+          <div>
+            <div className="text-[10px] uppercase tracking-wider text-slate-500">user_payload (per-lead)</div>
             <pre className="mt-1 whitespace-pre-wrap rounded bg-slate-50 p-2 font-mono text-[10px] leading-relaxed text-slate-700">{trace.user_payload}</pre>
           </div>
         </div>

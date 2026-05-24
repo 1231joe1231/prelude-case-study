@@ -34,31 +34,30 @@ async def get_ranked(
     persona = get_persona(db)
     all_features = extract_all(db, persona)
 
-    scored: list[tuple] = []
-    for f in all_features:
-        if f.is_not_interested:
-            continue
-        composite, components = score_lead(f)
-        scored.append((f, composite, components))
-
+    # not_interested leads are NOT filtered — they're penalized in score_lead
+    # so a strong re-engagement signal can still surface them.
+    scored = [(f, *score_lead(f)) for f in all_features]
     scored.sort(key=lambda x: x[1], reverse=True)
     top = scored[:limit]
 
+    n_not_interested = sum(1 for f in all_features if f.is_not_interested)
     emit(
         "ranking_request",
-        f"/ranked limit={limit} → returning top {len(top)} of {len(scored)} eligible",
+        f"/ranked limit={limit} → returning top {len(top)} of {len(scored)} scored",
         limit=limit,
         returned=len(top),
-        eligible=len(scored),
-        filtered_not_interested=len(all_features) - len(scored),
+        scored=len(scored),
+        not_interested_in_pool=n_not_interested,
     )
 
     # Seed cache + kick off background LLM batch for any uncached leads
     cache_snapshot = await get_or_kick([(f, c) for f, _, c in top])
 
     rows = []
+    row_stats = {"pending": 0, "llm": 0, "fallback": 0}
     for f, composite, components in top:
         cached = cache_snapshot.get(f.lead_id)
+        src = cached.source if cached else "fallback"
         rows.append({
             "lead_id": f.lead_id,
             "company": f.company,
@@ -66,15 +65,20 @@ async def get_ranked(
             "components": {k: round(v, 4) for k, v in components.items()},
             "features": f.to_dict(),
             "reasoning": cached.text if cached else "",
-            "rationale_source": cached.source if cached else "fallback",
+            "rationale_source": src,
             "factuality_ok": cached.factuality_ok if cached else False,
             "selected": False,
         })
+        row_stats[src] = row_stats.get(src, 0) + 1
 
     return {
         "rows": rows,
-        "stats": cache_stats(),
-        "pending_count": sum(1 for r in rows if r["rationale_source"] == "pending"),
+        # Stats are computed over the RANKED ROWS, not the whole cache, so the
+        # totals line up with what the table shows. Whole-cache stats live on
+        # /api/ranking/events for ops debugging.
+        "stats": row_stats,
+        "cache_stats": cache_stats(),
+        "pending_count": row_stats["pending"],
     }
 
 

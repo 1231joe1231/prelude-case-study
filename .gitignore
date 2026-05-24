@@ -24,6 +24,10 @@ dist/
 # Input data (not checked in)
 backend/input/
 
+# Dev-only artifacts: per-batch rationale dumps for weight/logic tuning.
+# Not part of project; gitignored so it doesn't clutter diffs.
+backend/.dev/
+
 # IDE
 .idea/
 .vscode/

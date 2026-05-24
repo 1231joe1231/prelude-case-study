@@ -45,7 +45,13 @@ log = logging.getLogger("uvicorn.error")
 MODEL_DEFAULT = os.environ.get("RATIONALE_MODEL", "claude-haiku-4-5-20251001")
 MAX_TOKENS = 220
 TEMPERATURE = 0.3
-CONCURRENCY = 10
+# Free-tier Anthropic limit is 50 requests/minute. A batch of 50 with
+# CONCURRENCY=10 finishes in ~5s, well above the per-minute ceiling, and we
+# observed 429s on the last snapshot. Drop to 4 in-flight so steady-state
+# throughput stays under the limit (~45/min including retries below).
+CONCURRENCY = 4
+LLM_RETRY_ATTEMPTS = 2   # 1 retry after first 429/transient error
+LLM_RETRY_BACKOFF_S = 1.5
 
 HS_CODE_RE = re.compile(r"\b(\d{6})\b")
 
@@ -138,19 +144,51 @@ def _build_user_payload(f: LeadFeatures, components: dict[str, float]) -> str:
         f"Top signal (highest-weighted component): {driver} — {driver_label}",
     ]
     if f.is_synced_to_crm:
-        parts.append("Already synced_to_crm — treat as in-play; deprioritize.")
+        parts.append("Already synced_to_crm — currently in the operator's pipeline.")
+    if f.is_not_interested:
+        parts.append(
+            "Status=not_interested — operator previously declined this lead. "
+            "Frame the rationale as a re-engagement angle: cite a new or strong "
+            "signal that justifies revisiting, otherwise honestly note the prior decline."
+        )
     return "\n".join(parts)
 
 
 # ---------- factuality check ----------
 
+def _has_numeric_bol_anchor(text: str, f: LeadFeatures) -> bool:
+    """True if the text honestly references one of the lead's numeric BOL
+    metrics (including legitimate zeros). Lets "no-signal" leads pass the
+    anchor requirement when no HS / port / competitor / title exists to cite.
+    """
+    lower = text.lower()
+    # Direct numeric mention of any populated BOL metric
+    for metric in (f.total_shipments, f.matching_shipments, f.days_since_recent):
+        if metric is not None and re.search(rf"\b{re.escape(str(metric))}\b", text):
+            return True
+    # Honest "zero/no" phrasing about activity — valid anchor when actually zero
+    if (f.total_shipments or 0) == 0 and (f.matching_shipments or 0) == 0:
+        if re.search(r"\b(no|zero|0)\s+(matching\s+)?shipments?\b", lower):
+            return True
+        if "no recent" in lower or "no import" in lower:
+            return True
+    return False
+
+
 def _factuality_check(text: str, f: LeadFeatures) -> FactualityCheck:
     """Verify cited facts exist in the feature payload.
 
     ok == True requires:
-      1. every 6-digit number cited is in f.lead_hs_codes
-      2. at least one specific fact is cited (HS code, port, competitor name,
-         or senior contact title) — pure prose with no anchor is rejected
+      1. every 6-digit number cited is in f.lead_hs_codes (no hallucinated HS)
+      2. at least one specific anchor cited. Anchors, in priority order:
+         a. HS code present in lead's hs_codes
+         b. port name from lead's top_ports
+         c. competitor name from lead's top_competitor_name
+         d. senior contact title
+         e. numeric BOL metric from the lead's own data (incl. honest zeros) —
+            covers the "no-signal" case where the lead has no positive anchor
+            available; without this rule a truthful "0 matching shipments, no
+            HS overlap" rationale would be wrongly rejected
     """
     lower = text.lower()
     lead_codes = set(f.lead_hs_codes)
@@ -169,13 +207,16 @@ def _factuality_check(text: str, f: LeadFeatures) -> FactualityCheck:
     if f.senior_contact_title and f.senior_contact_title.lower() in lower:
         cited_titles.append(f.senior_contact_title)
 
-    has_anchor = bool(cited_hs or cited_ports or cited_competitors or cited_titles)
+    has_bol_anchor = _has_numeric_bol_anchor(text, f)
+    has_anchor = bool(
+        cited_hs or cited_ports or cited_competitors or cited_titles or has_bol_anchor
+    )
 
     reason: str | None = None
     if not hs_ok:
         reason = f"cited HS code(s) {invalid_hs} not in lead's hs_codes"
     elif not has_anchor:
-        reason = "no specific anchor cited (no HS code, port, competitor, or title)"
+        reason = "no specific anchor cited (no HS code, port, competitor, title, or BOL metric)"
 
     return FactualityCheck(
         ok=hs_ok and has_anchor,
@@ -249,7 +290,7 @@ def fallback_text(f: LeadFeatures, components: dict[str, float]) -> str:
 async def _llm_call(
     client, f: LeadFeatures, user_payload: str
 ) -> tuple[str | None, LLMCallTrace]:
-    """Single Anthropic call.
+    """Single Anthropic call with one retry on rate-limit / transient errors.
 
     Returns (extracted_reasoning_text_or_None, llm_call_trace). The trace is
     always populated (latency, model, error string if any) so callers can audit
@@ -257,20 +298,46 @@ async def _llm_call(
     """
     started = time.monotonic()
     trace = LLMCallTrace(model=MODEL_DEFAULT, latency_ms=0)
+    msg = None
+    last_err: Exception | None = None
+    for attempt in range(LLM_RETRY_ATTEMPTS):
+        try:
+            msg = await client.messages.create(
+                model=MODEL_DEFAULT,
+                max_tokens=MAX_TOKENS,
+                temperature=TEMPERATURE,
+                system=[
+                    {
+                        "type": "text",
+                        "text": SYSTEM_PROMPT,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+                messages=[{"role": "user", "content": user_payload}],
+            )
+            last_err = None
+            break
+        except Exception as e:
+            last_err = e
+            # Retry only on 429 / transient errors; bail immediately on 4xx etc.
+            err_name = type(e).__name__
+            transient = "RateLimit" in err_name or "Timeout" in err_name or "APIConnection" in err_name
+            if not transient or attempt == LLM_RETRY_ATTEMPTS - 1:
+                break
+            log.warning(
+                "rationale.llm_call lead=%s attempt=%d transient err=%s — backing off %.1fs",
+                f.lead_id, attempt + 1, err_name, LLM_RETRY_BACKOFF_S,
+            )
+            await asyncio.sleep(LLM_RETRY_BACKOFF_S)
+
+    if msg is None:
+        # All attempts failed — capture last error and bail to fallback path
+        trace.latency_ms = int((time.monotonic() - started) * 1000)
+        trace.error = f"{type(last_err).__name__}: {last_err}" if last_err else "unknown error"
+        log.warning("rationale.llm_call lead=%s exhausted retries: %s", f.lead_id, trace.error)
+        return None, trace
+
     try:
-        msg = await client.messages.create(
-            model=MODEL_DEFAULT,
-            max_tokens=MAX_TOKENS,
-            temperature=TEMPERATURE,
-            system=[
-                {
-                    "type": "text",
-                    "text": SYSTEM_PROMPT,
-                    "cache_control": {"type": "ephemeral"},
-                }
-            ],
-            messages=[{"role": "user", "content": user_payload}],
-        )
         trace.latency_ms = int((time.monotonic() - started) * 1000)
         usage = getattr(msg, "usage", None)
         if usage is not None:
@@ -307,32 +374,119 @@ async def _llm_call(
         return None, trace
 
 
-SYSTEM_PROMPT_EXCERPT = SYSTEM_PROMPT[:240].strip() + "…"
 
 
 # ---------- public API ----------
 
-def _all_fallback(
-    items: list[tuple[LeadFeatures, dict[str, float]]],
-    source: RationaleSource,
-) -> list[tuple[Rationale, RationaleTrace]]:
-    out: list[tuple[Rationale, RationaleTrace]] = []
-    for f, c in items:
+def get_anthropic_client():
+    """Return an AsyncAnthropic client, or None if key/SDK is unavailable.
+
+    Returning None lets callers (e.g. cache._run_batch) cleanly take the
+    fallback path without raising. Cached behind module-level None test.
+    """
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return None
+    try:
+        from anthropic import AsyncAnthropic
+    except ImportError:
+        log.error("rationale: anthropic SDK not installed — using fallback")
+        return None
+    return AsyncAnthropic(api_key=api_key)
+
+
+def make_fallback(
+    f: LeadFeatures,
+    c: dict[str, float],
+    source: RationaleSource = "fallback_no_key",
+) -> tuple[Rationale, RationaleTrace]:
+    """Build (Rationale, RationaleTrace) for the deterministic fallback path."""
+    fb = fallback_text(f, c)
+    rationale = Rationale(text=fb, source=source, factuality_ok=True)
+    trace = RationaleTrace(
+        lead_id=f.lead_id,
+        generated_at=time.time(),
+        user_payload=_build_user_payload(f, c),
+        system_prompt=SYSTEM_PROMPT,
+        llm=None,
+        factuality=None,
+        final_source=source,
+        final_text=fb,
+        fallback_text=fb,
+    )
+    return rationale, trace
+
+
+async def rationalize_one_async(
+    client, f: LeadFeatures, c: dict[str, float]
+) -> tuple[Rationale, RationaleTrace]:
+    """Single-lead LLM path: call → factuality → outcome.
+
+    Caller is responsible for concurrency limiting (semaphore) and for
+    writing the result somewhere visible (cache, log, file). Use this when
+    you want to stream completions to the cache as they arrive rather than
+    waiting for a whole batch via `rationalize_batch_async`.
+    """
+    user_payload = _build_user_payload(f, c)
+    text, llm_trace = await _llm_call(client, f, user_payload)
+
+    trace = RationaleTrace(
+        lead_id=f.lead_id,
+        generated_at=time.time(),
+        user_payload=user_payload,
+        system_prompt=SYSTEM_PROMPT,
+        llm=llm_trace,
+    )
+
+    if not text:
         fb = fallback_text(f, c)
-        rationale = Rationale(text=fb, source=source, factuality_ok=True)
-        trace = RationaleTrace(
-            lead_id=f.lead_id,
-            generated_at=time.time(),
-            user_payload=_build_user_payload(f, c),
-            system_prompt_excerpt=SYSTEM_PROMPT_EXCERPT,
-            llm=None,
-            factuality=None,
-            final_source=source,
-            final_text=fb,
-            fallback_text=fb,
+        trace.final_source = "fallback_error"
+        trace.final_text = fb
+        trace.fallback_text = fb
+        emit("llm_call", f"LLM call failed for {f.company}",
+             lead_id=f.lead_id, latency_ms=llm_trace.latency_ms,
+             error=llm_trace.error or "empty response")
+        return Rationale(text=fb, source="fallback_error", factuality_ok=True), trace
+
+    fc = _factuality_check(text, f)
+    trace.factuality = fc
+
+    if not fc.ok:
+        fb = fallback_text(f, c)
+        trace.final_source = "fallback_factuality"
+        trace.final_text = fb
+        trace.fallback_text = fb
+        log.warning(
+            "rationale.factuality_fail lead=%s reason=%s text=%r",
+            f.lead_id, fc.reason, text[:120],
         )
-        out.append((rationale, trace))
-    return out
+        emit("factuality_fail", f"factuality rejected for {f.company}",
+             lead_id=f.lead_id, reason=fc.reason,
+             cited_hs=fc.cited_hs_codes, invalid_hs=fc.invalid_hs_codes,
+             text=text[:200])
+        return Rationale(
+            text=fb,
+            source="fallback_factuality",
+            factuality_ok=False,
+            cited_hs_codes=fc.cited_hs_codes,
+            cited_ports=fc.cited_ports,
+            cited_competitors=fc.cited_competitors,
+        ), trace
+
+    trace.final_source = "llm"
+    trace.final_text = text
+    emit("llm_call", f"LLM rationale generated for {f.company}",
+         lead_id=f.lead_id, latency_ms=llm_trace.latency_ms,
+         in_tok=llm_trace.input_tokens, out_tok=llm_trace.output_tokens,
+         cache_read=llm_trace.cache_read_input_tokens)
+    return Rationale(
+        text=text,
+        source="llm",
+        factuality_ok=True,
+        cited_hs_codes=fc.cited_hs_codes,
+        cited_ports=fc.cited_ports,
+        cited_competitors=fc.cited_competitors,
+    ), trace
 
 
 async def rationalize_batch_async(
@@ -342,98 +496,28 @@ async def rationalize_batch_async(
 ) -> list[tuple[Rationale, RationaleTrace]]:
     """Generate rationales + traces for a batch of (features, components) pairs.
 
-    Returns a list of (Rationale, RationaleTrace) pairs in input order. The
-    trace records every pipeline stage (input payload, LLM call, factuality
-    check, final outcome) for auditing via GET /api/leads/{id}/trace.
-
-    No key, no SDK, or batch-level failure → deterministic fallback per lead.
-    Per-lead LLM failure → that one lead falls back; others proceed.
-    Factuality check failure → that lead falls back; flagged in source.
+    Returns a list of (Rationale, RationaleTrace) pairs in INPUT ORDER. Awaits
+    all items before returning. For streaming (write each to cache as it
+    completes), call `rationalize_one_async` directly with your own semaphore.
     """
     if not items:
         return []
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
+    client = get_anthropic_client()
+    if client is None:
         log.info(
-            "rationale: ANTHROPIC_API_KEY not set — deterministic fallback for %d leads",
+            "rationale: no API key/SDK — deterministic fallback for %d leads",
             len(items),
         )
-        return _all_fallback(items, "fallback_no_key")
+        return [make_fallback(f, c, "fallback_no_key") for f, c in items]
 
-    try:
-        from anthropic import AsyncAnthropic
-    except ImportError:
-        log.error("rationale: anthropic SDK not installed — using fallback")
-        return _all_fallback(items, "fallback_no_key")
-
-    client = AsyncAnthropic(api_key=api_key)
     sem = asyncio.Semaphore(concurrency)
 
-    async def one(f: LeadFeatures, c: dict[str, float]) -> tuple[Rationale, RationaleTrace]:
-        user_payload = _build_user_payload(f, c)
+    async def guarded(f, c):
         async with sem:
-            text, llm_trace = await _llm_call(client, f, user_payload)
+            return await rationalize_one_async(client, f, c)
 
-        trace = RationaleTrace(
-            lead_id=f.lead_id,
-            generated_at=time.time(),
-            user_payload=user_payload,
-            system_prompt_excerpt=SYSTEM_PROMPT_EXCERPT,
-            llm=llm_trace,
-        )
-
-        if not text:
-            fb = fallback_text(f, c)
-            trace.final_source = "fallback_error"
-            trace.final_text = fb
-            trace.fallback_text = fb
-            emit("llm_call", f"LLM call failed for {f.company}",
-                 lead_id=f.lead_id, latency_ms=llm_trace.latency_ms,
-                 error=llm_trace.error or "empty response")
-            return Rationale(text=fb, source="fallback_error", factuality_ok=True), trace
-
-        fc = _factuality_check(text, f)
-        trace.factuality = fc
-
-        if not fc.ok:
-            fb = fallback_text(f, c)
-            trace.final_source = "fallback_factuality"
-            trace.final_text = fb
-            trace.fallback_text = fb
-            log.warning(
-                "rationale.factuality_fail lead=%s reason=%s text=%r",
-                f.lead_id, fc.reason, text[:120],
-            )
-            emit("factuality_fail", f"factuality rejected for {f.company}",
-                 lead_id=f.lead_id, reason=fc.reason,
-                 cited_hs=fc.cited_hs_codes, invalid_hs=fc.invalid_hs_codes,
-                 text=text[:200])
-            return Rationale(
-                text=fb,
-                source="fallback_factuality",
-                factuality_ok=False,
-                cited_hs_codes=fc.cited_hs_codes,
-                cited_ports=fc.cited_ports,
-                cited_competitors=fc.cited_competitors,
-            ), trace
-
-        trace.final_source = "llm"
-        trace.final_text = text
-        emit("llm_call", f"LLM rationale generated for {f.company}",
-             lead_id=f.lead_id, latency_ms=llm_trace.latency_ms,
-             in_tok=llm_trace.input_tokens, out_tok=llm_trace.output_tokens,
-             cache_read=llm_trace.cache_read_input_tokens)
-        return Rationale(
-            text=text,
-            source="llm",
-            factuality_ok=True,
-            cited_hs_codes=fc.cited_hs_codes,
-            cited_ports=fc.cited_ports,
-            cited_competitors=fc.cited_competitors,
-        ), trace
-
-    return await asyncio.gather(*(one(f, c) for f, c in items))
+    return await asyncio.gather(*(guarded(f, c) for f, c in items))
 
 
 def rationalize_batch(

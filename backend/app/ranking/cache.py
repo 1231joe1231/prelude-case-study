@@ -24,9 +24,12 @@ from typing import Literal
 
 from .features import LeadFeatures
 from .rationale import (
+    CONCURRENCY,
     Rationale,
     fallback_text,
-    rationalize_batch_async,
+    get_anthropic_client,
+    make_fallback,
+    rationalize_one_async,
 )
 from .trace import emit, put_trace
 
@@ -112,49 +115,75 @@ async def get_or_kick(
     return snapshot
 
 
-async def _run_batch(items: list[tuple[LeadFeatures, dict[str, float]]]) -> None:
-    """Background worker: run LLM batch, write results + traces to cache."""
-    lead_ids = [f.lead_id for f, _ in items]
-    started = time.time()
-    try:
-        results = await rationalize_batch_async(items)
-    except Exception as e:
-        log.exception("rationale.cache: batch failed for %d leads", len(items))
-        emit(
-            "batch_complete",
-            f"LLM batch FAILED for {len(items)} lead(s)",
-            count=len(items),
-            error=f"{type(e).__name__}: {e}",
-            duration_ms=int((time.time() - started) * 1000),
-        )
-        results = None
-
+async def _persist_result(
+    f: LeadFeatures, rationale: Rationale, trace
+) -> None:
+    """Write one finished lead's result + trace to the cache. Single source of
+    truth for cache mutation from background workers."""
     async with _lock:
-        if results is not None:
-            for (f, _), (rationale, trace) in zip(items, results):
-                _cache[f.lead_id] = _to_cached(rationale)
-                put_trace(trace)
-        else:
-            # Batch died entirely: downgrade pending → fallback (already in text)
-            for f, _ in items:
-                cur = _cache.get(f.lead_id)
-                if cur and cur.source == "pending":
-                    cur.source = "fallback"
-        for lid in lead_ids:
-            _in_flight.discard(lid)
+        _cache[f.lead_id] = _to_cached(rationale)
+        put_trace(trace)
+        _in_flight.discard(f.lead_id)
 
-    if results is not None:
-        by_source: dict[str, int] = {}
-        for _, t in results:
+
+async def _run_batch(items: list[tuple[LeadFeatures, dict[str, float]]]) -> None:
+    """Background worker: stream per-lead rationales → cache as each completes.
+
+    Each lead is its own awaitable; the cache write happens the moment the
+    lead's rationale + factuality check resolve, so the frontend's 2s poll
+    sees rationales appear incrementally instead of all-at-once.
+    """
+    started = time.time()
+    by_source: dict[str, int] = {}
+
+    client = get_anthropic_client()
+    if client is None:
+        # No key / no SDK — write fallback for every lead immediately
+        log.info("rationale.cache: no API key/SDK; fallback for %d leads", len(items))
+        for f, c in items:
+            r, t = make_fallback(f, c, "fallback_no_key")
+            await _persist_result(f, r, t)
             by_source[t.final_source] = by_source.get(t.final_source, 0) + 1
         emit(
             "batch_complete",
-            f"LLM batch complete: {by_source}",
+            f"LLM batch complete (no-key fallback): {by_source}",
             count=len(items),
             by_source=by_source,
             duration_ms=int((time.time() - started) * 1000),
         )
-    log.info("rationale.cache: batch complete for %d leads", len(items))
+        return
+
+    sem = asyncio.Semaphore(CONCURRENCY)
+
+    async def worker(f: LeadFeatures, c: dict[str, float]) -> str:
+        async with sem:
+            try:
+                rationale, trace = await rationalize_one_async(client, f, c)
+            except Exception as e:
+                log.exception("rationale.cache: worker crashed for lead=%s", f.lead_id)
+                rationale, trace = make_fallback(f, c, "fallback_error")
+                if trace.llm is None:
+                    pass  # make_fallback already set llm=None
+                trace.final_text = rationale.text
+        await _persist_result(f, rationale, trace)
+        return trace.final_source
+
+    tasks = [asyncio.create_task(worker(f, c)) for f, c in items]
+    for coro in asyncio.as_completed(tasks):
+        try:
+            src = await coro
+            by_source[src] = by_source.get(src, 0) + 1
+        except Exception:
+            log.exception("rationale.cache: task wrapper exception")
+
+    emit(
+        "batch_complete",
+        f"LLM batch complete: {by_source}",
+        count=len(items),
+        by_source=by_source,
+        duration_ms=int((time.time() - started) * 1000),
+    )
+    log.info("rationale.cache: batch complete for %d leads (%s)", len(items), by_source)
 
 
 def get_cached(lead_id: str) -> CachedRationale | None:
